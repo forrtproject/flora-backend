@@ -1,0 +1,1266 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "The AWS CloudFormation template for this Serverless application",
+  "Resources": {
+    "ServerlessDeploymentBucket": {
+      "Type": "AWS::S3::Bucket",
+      "Properties": {
+        "BucketEncryption": {
+          "ServerSideEncryptionConfiguration": [
+            {
+              "ServerSideEncryptionByDefault": {
+                "SSEAlgorithm": "AES256"
+              }
+            }
+          ]
+        }
+      }
+    },
+    "ServerlessDeploymentBucketPolicy": {
+      "Type": "AWS::S3::BucketPolicy",
+      "Properties": {
+        "Bucket": {
+          "Ref": "ServerlessDeploymentBucket"
+        },
+        "PolicyDocument": {
+          "Statement": [
+            {
+              "Action": "s3:*",
+              "Effect": "Deny",
+              "Principal": "*",
+              "Resource": [
+                {
+                  "Fn::Join": [
+                    "",
+                    [
+                      "arn:",
+                      {
+                        "Ref": "AWS::Partition"
+                      },
+                      ":s3:::",
+                      {
+                        "Ref": "ServerlessDeploymentBucket"
+                      },
+                      "/*"
+                    ]
+                  ]
+                },
+                {
+                  "Fn::Join": [
+                    "",
+                    [
+                      "arn:",
+                      {
+                        "Ref": "AWS::Partition"
+                      },
+                      ":s3:::",
+                      {
+                        "Ref": "ServerlessDeploymentBucket"
+                      }
+                    ]
+                  ]
+                }
+              ],
+              "Condition": {
+                "Bool": {
+                  "aws:SecureTransport": false
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "PrefixLookupLogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": "/aws/lambda/zotero-replication-backend-dev2-prefixLookup"
+      }
+    },
+    "OriginalLookupLogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": "/aws/lambda/zotero-replication-backend-dev2-originalLookup"
+      }
+    },
+    "DoiListLogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": "/aws/lambda/zotero-replication-backend-dev2-doiList"
+      }
+    },
+    "FilterOptionsLogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": "/aws/lambda/zotero-replication-backend-dev2-filterOptions"
+      }
+    },
+    "RecordsListLogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": "/aws/lambda/zotero-replication-backend-dev2-recordsList"
+      }
+    },
+    "FuzzySearchLogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": "/aws/lambda/zotero-replication-backend-dev2-fuzzySearch"
+      }
+    },
+    "IamRoleLambdaExecution": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": [
+                  "lambda.amazonaws.com"
+                ]
+              },
+              "Action": [
+                "sts:AssumeRole"
+              ]
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": {
+              "Fn::Join": [
+                "-",
+                [
+                  "zotero-replication-backend",
+                  "dev2",
+                  "lambda"
+                ]
+              ]
+            },
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "logs:CreateLogStream",
+                    "logs:CreateLogGroup",
+                    "logs:TagResource"
+                  ],
+                  "Resource": [
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/zotero-replication-backend-dev2*:*"
+                    }
+                  ]
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "logs:PutLogEvents"
+                  ],
+                  "Resource": [
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/zotero-replication-backend-dev2*:*:*"
+                    }
+                  ]
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "dynamodb:GetItem",
+                    "dynamodb:BatchGetItem",
+                    "dynamodb:Query",
+                    "dynamodb:Scan"
+                  ],
+                  "Resource": [
+                    "arn:aws:dynamodb:eu-central-1:*:table/zotero-replication-backend-dev2-original",
+                    "arn:aws:dynamodb:eu-central-1:*:table/zotero-replication-backend-dev2-original/index/*",
+                    "arn:aws:dynamodb:eu-central-1:*:table/zotero-replication-backend-dev2-replication",
+                    "arn:aws:dynamodb:eu-central-1:*:table/zotero-replication-backend-dev2-replication/index/*",
+                    "arn:aws:dynamodb:eu-central-1:*:table/zotero-replication-backend-dev2-reproduction",
+                    "arn:aws:dynamodb:eu-central-1:*:table/zotero-replication-backend-dev2-reproduction/index/*",
+                    "arn:aws:dynamodb:eu-central-1:*:table/zotero-replication-backend-dev2-search"
+                  ]
+                }
+              ]
+            }
+          }
+        ],
+        "Path": "/",
+        "RoleName": {
+          "Fn::Join": [
+            "-",
+            [
+              "zotero-replication-backend",
+              "dev2",
+              {
+                "Ref": "AWS::Region"
+              },
+              "lambdaRole"
+            ]
+          ]
+        }
+      }
+    },
+    "PrefixLookupLambdaFunction": {
+      "Type": "AWS::Lambda::Function",
+      "Properties": {
+        "Code": {
+          "S3Bucket": {
+            "Ref": "ServerlessDeploymentBucket"
+          },
+          "S3Key": "serverless/zotero-replication-backend/dev2/1778058539396-2026-05-06T09:08:59.396Z/zotero-replication-backend.zip"
+        },
+        "Handler": "src/handler.handler",
+        "Runtime": "nodejs24.x",
+        "FunctionName": "zotero-replication-backend-dev2-prefixLookup",
+        "MemorySize": 1024,
+        "Timeout": 6,
+        "Environment": {
+          "Variables": {
+            "ORIGINAL_TABLE": "zotero-replication-backend-dev2-original",
+            "REPLICATION_TABLE": "zotero-replication-backend-dev2-replication",
+            "REPRODUCTION_TABLE": "zotero-replication-backend-dev2-reproduction",
+            "SEARCH_TABLE": "zotero-replication-backend-dev2-search"
+          }
+        },
+        "Role": {
+          "Fn::GetAtt": [
+            "IamRoleLambdaExecution",
+            "Arn"
+          ]
+        }
+      },
+      "DependsOn": [
+        "PrefixLookupLogGroup"
+      ]
+    },
+    "OriginalLookupLambdaFunction": {
+      "Type": "AWS::Lambda::Function",
+      "Properties": {
+        "Code": {
+          "S3Bucket": {
+            "Ref": "ServerlessDeploymentBucket"
+          },
+          "S3Key": "serverless/zotero-replication-backend/dev2/1778058539396-2026-05-06T09:08:59.396Z/zotero-replication-backend.zip"
+        },
+        "Handler": "src/original.handler",
+        "Runtime": "nodejs24.x",
+        "FunctionName": "zotero-replication-backend-dev2-originalLookup",
+        "MemorySize": 1024,
+        "Timeout": 6,
+        "Environment": {
+          "Variables": {
+            "ORIGINAL_TABLE": "zotero-replication-backend-dev2-original",
+            "REPLICATION_TABLE": "zotero-replication-backend-dev2-replication",
+            "REPRODUCTION_TABLE": "zotero-replication-backend-dev2-reproduction",
+            "SEARCH_TABLE": "zotero-replication-backend-dev2-search"
+          }
+        },
+        "Role": {
+          "Fn::GetAtt": [
+            "IamRoleLambdaExecution",
+            "Arn"
+          ]
+        }
+      },
+      "DependsOn": [
+        "OriginalLookupLogGroup"
+      ]
+    },
+    "DoiListLambdaFunction": {
+      "Type": "AWS::Lambda::Function",
+      "Properties": {
+        "Code": {
+          "S3Bucket": {
+            "Ref": "ServerlessDeploymentBucket"
+          },
+          "S3Key": "serverless/zotero-replication-backend/dev2/1778058539396-2026-05-06T09:08:59.396Z/zotero-replication-backend.zip"
+        },
+        "Handler": "src/dois.handler",
+        "Runtime": "nodejs24.x",
+        "FunctionName": "zotero-replication-backend-dev2-doiList",
+        "MemorySize": 1024,
+        "Timeout": 6,
+        "Environment": {
+          "Variables": {
+            "ORIGINAL_TABLE": "zotero-replication-backend-dev2-original",
+            "REPLICATION_TABLE": "zotero-replication-backend-dev2-replication",
+            "REPRODUCTION_TABLE": "zotero-replication-backend-dev2-reproduction",
+            "SEARCH_TABLE": "zotero-replication-backend-dev2-search"
+          }
+        },
+        "Role": {
+          "Fn::GetAtt": [
+            "IamRoleLambdaExecution",
+            "Arn"
+          ]
+        }
+      },
+      "DependsOn": [
+        "DoiListLogGroup"
+      ]
+    },
+    "FilterOptionsLambdaFunction": {
+      "Type": "AWS::Lambda::Function",
+      "Properties": {
+        "Code": {
+          "S3Bucket": {
+            "Ref": "ServerlessDeploymentBucket"
+          },
+          "S3Key": "serverless/zotero-replication-backend/dev2/1778058539396-2026-05-06T09:08:59.396Z/zotero-replication-backend.zip"
+        },
+        "Handler": "src/filters.handler",
+        "Runtime": "nodejs24.x",
+        "FunctionName": "zotero-replication-backend-dev2-filterOptions",
+        "MemorySize": 1024,
+        "Timeout": 30,
+        "Environment": {
+          "Variables": {
+            "ORIGINAL_TABLE": "zotero-replication-backend-dev2-original",
+            "REPLICATION_TABLE": "zotero-replication-backend-dev2-replication",
+            "REPRODUCTION_TABLE": "zotero-replication-backend-dev2-reproduction",
+            "SEARCH_TABLE": "zotero-replication-backend-dev2-search"
+          }
+        },
+        "Role": {
+          "Fn::GetAtt": [
+            "IamRoleLambdaExecution",
+            "Arn"
+          ]
+        }
+      },
+      "DependsOn": [
+        "FilterOptionsLogGroup"
+      ]
+    },
+    "RecordsListLambdaFunction": {
+      "Type": "AWS::Lambda::Function",
+      "Properties": {
+        "Code": {
+          "S3Bucket": {
+            "Ref": "ServerlessDeploymentBucket"
+          },
+          "S3Key": "serverless/zotero-replication-backend/dev2/1778058539396-2026-05-06T09:08:59.396Z/zotero-replication-backend.zip"
+        },
+        "Handler": "src/records.handler",
+        "Runtime": "nodejs24.x",
+        "FunctionName": "zotero-replication-backend-dev2-recordsList",
+        "MemorySize": 1024,
+        "Timeout": 6,
+        "Environment": {
+          "Variables": {
+            "ORIGINAL_TABLE": "zotero-replication-backend-dev2-original",
+            "REPLICATION_TABLE": "zotero-replication-backend-dev2-replication",
+            "REPRODUCTION_TABLE": "zotero-replication-backend-dev2-reproduction",
+            "SEARCH_TABLE": "zotero-replication-backend-dev2-search"
+          }
+        },
+        "Role": {
+          "Fn::GetAtt": [
+            "IamRoleLambdaExecution",
+            "Arn"
+          ]
+        }
+      },
+      "DependsOn": [
+        "RecordsListLogGroup"
+      ]
+    },
+    "FuzzySearchLambdaFunction": {
+      "Type": "AWS::Lambda::Function",
+      "Properties": {
+        "Code": {
+          "S3Bucket": {
+            "Ref": "ServerlessDeploymentBucket"
+          },
+          "S3Key": "serverless/zotero-replication-backend/dev2/1778058539396-2026-05-06T09:08:59.396Z/zotero-replication-backend.zip"
+        },
+        "Handler": "src/search.handler",
+        "Runtime": "nodejs24.x",
+        "FunctionName": "zotero-replication-backend-dev2-fuzzySearch",
+        "MemorySize": 1024,
+        "Timeout": 15,
+        "Environment": {
+          "Variables": {
+            "ORIGINAL_TABLE": "zotero-replication-backend-dev2-original",
+            "REPLICATION_TABLE": "zotero-replication-backend-dev2-replication",
+            "REPRODUCTION_TABLE": "zotero-replication-backend-dev2-reproduction",
+            "SEARCH_TABLE": "zotero-replication-backend-dev2-search"
+          }
+        },
+        "Role": {
+          "Fn::GetAtt": [
+            "IamRoleLambdaExecution",
+            "Arn"
+          ]
+        }
+      },
+      "DependsOn": [
+        "FuzzySearchLogGroup"
+      ]
+    },
+    "PrefixLookupLambdaVersiontXbEaTlFGnSIZ3WzSRPS4M2NQV9P9TsEED0FdYjxssw": {
+      "Type": "AWS::Lambda::Version",
+      "DeletionPolicy": "Retain",
+      "Properties": {
+        "FunctionName": {
+          "Ref": "PrefixLookupLambdaFunction"
+        },
+        "CodeSha256": "I/PD9c8r9A10xVrMQi96OUXc8pdcy3YCwVfKtpQrW8k="
+      }
+    },
+    "OriginalLookupLambdaVersionXax8d9F5z8G4X5wM9FJduK6N56vmmJL7ocVxa4P0": {
+      "Type": "AWS::Lambda::Version",
+      "DeletionPolicy": "Retain",
+      "Properties": {
+        "FunctionName": {
+          "Ref": "OriginalLookupLambdaFunction"
+        },
+        "CodeSha256": "I/PD9c8r9A10xVrMQi96OUXc8pdcy3YCwVfKtpQrW8k="
+      }
+    },
+    "DoiListLambdaVersiong4E2JsB4REf45fUiBIvS4XoQHCapYarS6SfyBZJ6F0": {
+      "Type": "AWS::Lambda::Version",
+      "DeletionPolicy": "Retain",
+      "Properties": {
+        "FunctionName": {
+          "Ref": "DoiListLambdaFunction"
+        },
+        "CodeSha256": "I/PD9c8r9A10xVrMQi96OUXc8pdcy3YCwVfKtpQrW8k="
+      }
+    },
+    "FilterOptionsLambdaVersion7gqC9SNnShWUu4fwga4L8uICYpdW6jXvl338mZ1J8": {
+      "Type": "AWS::Lambda::Version",
+      "DeletionPolicy": "Retain",
+      "Properties": {
+        "FunctionName": {
+          "Ref": "FilterOptionsLambdaFunction"
+        },
+        "CodeSha256": "I/PD9c8r9A10xVrMQi96OUXc8pdcy3YCwVfKtpQrW8k="
+      }
+    },
+    "RecordsListLambdaVersionjGXfPJXwDMQWaNtLTgAHpIOt0iDv2kbfOL4oOkak": {
+      "Type": "AWS::Lambda::Version",
+      "DeletionPolicy": "Retain",
+      "Properties": {
+        "FunctionName": {
+          "Ref": "RecordsListLambdaFunction"
+        },
+        "CodeSha256": "I/PD9c8r9A10xVrMQi96OUXc8pdcy3YCwVfKtpQrW8k="
+      }
+    },
+    "FuzzySearchLambdaVersionmOWvdauST5j8hK2rH1ZkBfw1s3Ujiab03KbzjBNE0o": {
+      "Type": "AWS::Lambda::Version",
+      "DeletionPolicy": "Retain",
+      "Properties": {
+        "FunctionName": {
+          "Ref": "FuzzySearchLambdaFunction"
+        },
+        "CodeSha256": "I/PD9c8r9A10xVrMQi96OUXc8pdcy3YCwVfKtpQrW8k="
+      }
+    },
+    "HttpApi": {
+      "Type": "AWS::ApiGatewayV2::Api",
+      "Properties": {
+        "Name": "dev2-zotero-replication-backend",
+        "ProtocolType": "HTTP",
+        "CorsConfiguration": {
+          "AllowHeaders": [
+            "Content-Type",
+            "X-Amz-Date",
+            "Authorization",
+            "X-Api-Key",
+            "X-Amz-Security-Token",
+            "X-Amz-User-Agent",
+            "X-Amzn-Trace-Id"
+          ],
+          "AllowMethods": [
+            "OPTIONS",
+            "GET",
+            "POST"
+          ],
+          "AllowOrigins": [
+            "*"
+          ]
+        }
+      }
+    },
+    "HttpApiStage": {
+      "Type": "AWS::ApiGatewayV2::Stage",
+      "Properties": {
+        "ApiId": {
+          "Ref": "HttpApi"
+        },
+        "StageName": "$default",
+        "AutoDeploy": true,
+        "DefaultRouteSettings": {
+          "DetailedMetricsEnabled": false
+        }
+      }
+    },
+    "PrefixLookupLambdaPermissionHttpApi": {
+      "Type": "AWS::Lambda::Permission",
+      "Properties": {
+        "FunctionName": {
+          "Fn::GetAtt": [
+            "PrefixLookupLambdaFunction",
+            "Arn"
+          ]
+        },
+        "Action": "lambda:InvokeFunction",
+        "Principal": "apigateway.amazonaws.com",
+        "SourceArn": {
+          "Fn::Join": [
+            "",
+            [
+              "arn:",
+              {
+                "Ref": "AWS::Partition"
+              },
+              ":execute-api:",
+              {
+                "Ref": "AWS::Region"
+              },
+              ":",
+              {
+                "Ref": "AWS::AccountId"
+              },
+              ":",
+              {
+                "Ref": "HttpApi"
+              },
+              "/*"
+            ]
+          ]
+        }
+      }
+    },
+    "HttpApiIntegrationPrefixLookup": {
+      "Type": "AWS::ApiGatewayV2::Integration",
+      "Properties": {
+        "ApiId": {
+          "Ref": "HttpApi"
+        },
+        "IntegrationType": "AWS_PROXY",
+        "IntegrationUri": {
+          "Fn::GetAtt": [
+            "PrefixLookupLambdaFunction",
+            "Arn"
+          ]
+        },
+        "PayloadFormatVersion": "2.0",
+        "TimeoutInMillis": 30000
+      }
+    },
+    "HttpApiRouteGetV1PrefixDashlookup": {
+      "Type": "AWS::ApiGatewayV2::Route",
+      "Properties": {
+        "ApiId": {
+          "Ref": "HttpApi"
+        },
+        "RouteKey": "GET /v1/prefix-lookup",
+        "Target": {
+          "Fn::Join": [
+            "/",
+            [
+              "integrations",
+              {
+                "Ref": "HttpApiIntegrationPrefixLookup"
+              }
+            ]
+          ]
+        }
+      },
+      "DependsOn": "HttpApiIntegrationPrefixLookup"
+    },
+    "HttpApiRoutePostV1PrefixDashlookup": {
+      "Type": "AWS::ApiGatewayV2::Route",
+      "Properties": {
+        "ApiId": {
+          "Ref": "HttpApi"
+        },
+        "RouteKey": "POST /v1/prefix-lookup",
+        "Target": {
+          "Fn::Join": [
+            "/",
+            [
+              "integrations",
+              {
+                "Ref": "HttpApiIntegrationPrefixLookup"
+              }
+            ]
+          ]
+        }
+      },
+      "DependsOn": "HttpApiIntegrationPrefixLookup"
+    },
+    "OriginalLookupLambdaPermissionHttpApi": {
+      "Type": "AWS::Lambda::Permission",
+      "Properties": {
+        "FunctionName": {
+          "Fn::GetAtt": [
+            "OriginalLookupLambdaFunction",
+            "Arn"
+          ]
+        },
+        "Action": "lambda:InvokeFunction",
+        "Principal": "apigateway.amazonaws.com",
+        "SourceArn": {
+          "Fn::Join": [
+            "",
+            [
+              "arn:",
+              {
+                "Ref": "AWS::Partition"
+              },
+              ":execute-api:",
+              {
+                "Ref": "AWS::Region"
+              },
+              ":",
+              {
+                "Ref": "AWS::AccountId"
+              },
+              ":",
+              {
+                "Ref": "HttpApi"
+              },
+              "/*"
+            ]
+          ]
+        }
+      }
+    },
+    "HttpApiIntegrationOriginalLookup": {
+      "Type": "AWS::ApiGatewayV2::Integration",
+      "Properties": {
+        "ApiId": {
+          "Ref": "HttpApi"
+        },
+        "IntegrationType": "AWS_PROXY",
+        "IntegrationUri": {
+          "Fn::GetAtt": [
+            "OriginalLookupLambdaFunction",
+            "Arn"
+          ]
+        },
+        "PayloadFormatVersion": "2.0",
+        "TimeoutInMillis": 30000
+      }
+    },
+    "HttpApiRouteGetV1OriginalDashlookup": {
+      "Type": "AWS::ApiGatewayV2::Route",
+      "Properties": {
+        "ApiId": {
+          "Ref": "HttpApi"
+        },
+        "RouteKey": "GET /v1/original-lookup",
+        "Target": {
+          "Fn::Join": [
+            "/",
+            [
+              "integrations",
+              {
+                "Ref": "HttpApiIntegrationOriginalLookup"
+              }
+            ]
+          ]
+        }
+      },
+      "DependsOn": "HttpApiIntegrationOriginalLookup"
+    },
+    "HttpApiRoutePostV1OriginalDashlookup": {
+      "Type": "AWS::ApiGatewayV2::Route",
+      "Properties": {
+        "ApiId": {
+          "Ref": "HttpApi"
+        },
+        "RouteKey": "POST /v1/original-lookup",
+        "Target": {
+          "Fn::Join": [
+            "/",
+            [
+              "integrations",
+              {
+                "Ref": "HttpApiIntegrationOriginalLookup"
+              }
+            ]
+          ]
+        }
+      },
+      "DependsOn": "HttpApiIntegrationOriginalLookup"
+    },
+    "DoiListLambdaPermissionHttpApi": {
+      "Type": "AWS::Lambda::Permission",
+      "Properties": {
+        "FunctionName": {
+          "Fn::GetAtt": [
+            "DoiListLambdaFunction",
+            "Arn"
+          ]
+        },
+        "Action": "lambda:InvokeFunction",
+        "Principal": "apigateway.amazonaws.com",
+        "SourceArn": {
+          "Fn::Join": [
+            "",
+            [
+              "arn:",
+              {
+                "Ref": "AWS::Partition"
+              },
+              ":execute-api:",
+              {
+                "Ref": "AWS::Region"
+              },
+              ":",
+              {
+                "Ref": "AWS::AccountId"
+              },
+              ":",
+              {
+                "Ref": "HttpApi"
+              },
+              "/*"
+            ]
+          ]
+        }
+      }
+    },
+    "HttpApiIntegrationDoiList": {
+      "Type": "AWS::ApiGatewayV2::Integration",
+      "Properties": {
+        "ApiId": {
+          "Ref": "HttpApi"
+        },
+        "IntegrationType": "AWS_PROXY",
+        "IntegrationUri": {
+          "Fn::GetAtt": [
+            "DoiListLambdaFunction",
+            "Arn"
+          ]
+        },
+        "PayloadFormatVersion": "2.0",
+        "TimeoutInMillis": 30000
+      }
+    },
+    "HttpApiRouteGetV1Dois": {
+      "Type": "AWS::ApiGatewayV2::Route",
+      "Properties": {
+        "ApiId": {
+          "Ref": "HttpApi"
+        },
+        "RouteKey": "GET /v1/dois",
+        "Target": {
+          "Fn::Join": [
+            "/",
+            [
+              "integrations",
+              {
+                "Ref": "HttpApiIntegrationDoiList"
+              }
+            ]
+          ]
+        }
+      },
+      "DependsOn": "HttpApiIntegrationDoiList"
+    },
+    "FilterOptionsLambdaPermissionHttpApi": {
+      "Type": "AWS::Lambda::Permission",
+      "Properties": {
+        "FunctionName": {
+          "Fn::GetAtt": [
+            "FilterOptionsLambdaFunction",
+            "Arn"
+          ]
+        },
+        "Action": "lambda:InvokeFunction",
+        "Principal": "apigateway.amazonaws.com",
+        "SourceArn": {
+          "Fn::Join": [
+            "",
+            [
+              "arn:",
+              {
+                "Ref": "AWS::Partition"
+              },
+              ":execute-api:",
+              {
+                "Ref": "AWS::Region"
+              },
+              ":",
+              {
+                "Ref": "AWS::AccountId"
+              },
+              ":",
+              {
+                "Ref": "HttpApi"
+              },
+              "/*"
+            ]
+          ]
+        }
+      }
+    },
+    "HttpApiIntegrationFilterOptions": {
+      "Type": "AWS::ApiGatewayV2::Integration",
+      "Properties": {
+        "ApiId": {
+          "Ref": "HttpApi"
+        },
+        "IntegrationType": "AWS_PROXY",
+        "IntegrationUri": {
+          "Fn::GetAtt": [
+            "FilterOptionsLambdaFunction",
+            "Arn"
+          ]
+        },
+        "PayloadFormatVersion": "2.0",
+        "TimeoutInMillis": 30000
+      }
+    },
+    "HttpApiRouteGetV1FilterDashoptions": {
+      "Type": "AWS::ApiGatewayV2::Route",
+      "Properties": {
+        "ApiId": {
+          "Ref": "HttpApi"
+        },
+        "RouteKey": "GET /v1/filter-options",
+        "Target": {
+          "Fn::Join": [
+            "/",
+            [
+              "integrations",
+              {
+                "Ref": "HttpApiIntegrationFilterOptions"
+              }
+            ]
+          ]
+        }
+      },
+      "DependsOn": "HttpApiIntegrationFilterOptions"
+    },
+    "RecordsListLambdaPermissionHttpApi": {
+      "Type": "AWS::Lambda::Permission",
+      "Properties": {
+        "FunctionName": {
+          "Fn::GetAtt": [
+            "RecordsListLambdaFunction",
+            "Arn"
+          ]
+        },
+        "Action": "lambda:InvokeFunction",
+        "Principal": "apigateway.amazonaws.com",
+        "SourceArn": {
+          "Fn::Join": [
+            "",
+            [
+              "arn:",
+              {
+                "Ref": "AWS::Partition"
+              },
+              ":execute-api:",
+              {
+                "Ref": "AWS::Region"
+              },
+              ":",
+              {
+                "Ref": "AWS::AccountId"
+              },
+              ":",
+              {
+                "Ref": "HttpApi"
+              },
+              "/*"
+            ]
+          ]
+        }
+      }
+    },
+    "HttpApiIntegrationRecordsList": {
+      "Type": "AWS::ApiGatewayV2::Integration",
+      "Properties": {
+        "ApiId": {
+          "Ref": "HttpApi"
+        },
+        "IntegrationType": "AWS_PROXY",
+        "IntegrationUri": {
+          "Fn::GetAtt": [
+            "RecordsListLambdaFunction",
+            "Arn"
+          ]
+        },
+        "PayloadFormatVersion": "2.0",
+        "TimeoutInMillis": 30000
+      }
+    },
+    "HttpApiRouteGetV1Records": {
+      "Type": "AWS::ApiGatewayV2::Route",
+      "Properties": {
+        "ApiId": {
+          "Ref": "HttpApi"
+        },
+        "RouteKey": "GET /v1/records",
+        "Target": {
+          "Fn::Join": [
+            "/",
+            [
+              "integrations",
+              {
+                "Ref": "HttpApiIntegrationRecordsList"
+              }
+            ]
+          ]
+        }
+      },
+      "DependsOn": "HttpApiIntegrationRecordsList"
+    },
+    "HttpApiRoutePostV1Records": {
+      "Type": "AWS::ApiGatewayV2::Route",
+      "Properties": {
+        "ApiId": {
+          "Ref": "HttpApi"
+        },
+        "RouteKey": "POST /v1/records",
+        "Target": {
+          "Fn::Join": [
+            "/",
+            [
+              "integrations",
+              {
+                "Ref": "HttpApiIntegrationRecordsList"
+              }
+            ]
+          ]
+        }
+      },
+      "DependsOn": "HttpApiIntegrationRecordsList"
+    },
+    "FuzzySearchLambdaPermissionHttpApi": {
+      "Type": "AWS::Lambda::Permission",
+      "Properties": {
+        "FunctionName": {
+          "Fn::GetAtt": [
+            "FuzzySearchLambdaFunction",
+            "Arn"
+          ]
+        },
+        "Action": "lambda:InvokeFunction",
+        "Principal": "apigateway.amazonaws.com",
+        "SourceArn": {
+          "Fn::Join": [
+            "",
+            [
+              "arn:",
+              {
+                "Ref": "AWS::Partition"
+              },
+              ":execute-api:",
+              {
+                "Ref": "AWS::Region"
+              },
+              ":",
+              {
+                "Ref": "AWS::AccountId"
+              },
+              ":",
+              {
+                "Ref": "HttpApi"
+              },
+              "/*"
+            ]
+          ]
+        }
+      }
+    },
+    "HttpApiIntegrationFuzzySearch": {
+      "Type": "AWS::ApiGatewayV2::Integration",
+      "Properties": {
+        "ApiId": {
+          "Ref": "HttpApi"
+        },
+        "IntegrationType": "AWS_PROXY",
+        "IntegrationUri": {
+          "Fn::GetAtt": [
+            "FuzzySearchLambdaFunction",
+            "Arn"
+          ]
+        },
+        "PayloadFormatVersion": "2.0",
+        "TimeoutInMillis": 30000
+      }
+    },
+    "HttpApiRouteGetV1Search": {
+      "Type": "AWS::ApiGatewayV2::Route",
+      "Properties": {
+        "ApiId": {
+          "Ref": "HttpApi"
+        },
+        "RouteKey": "GET /v1/search",
+        "Target": {
+          "Fn::Join": [
+            "/",
+            [
+              "integrations",
+              {
+                "Ref": "HttpApiIntegrationFuzzySearch"
+              }
+            ]
+          ]
+        }
+      },
+      "DependsOn": "HttpApiIntegrationFuzzySearch"
+    },
+    "HttpApiRoutePostV1Search": {
+      "Type": "AWS::ApiGatewayV2::Route",
+      "Properties": {
+        "ApiId": {
+          "Ref": "HttpApi"
+        },
+        "RouteKey": "POST /v1/search",
+        "Target": {
+          "Fn::Join": [
+            "/",
+            [
+              "integrations",
+              {
+                "Ref": "HttpApiIntegrationFuzzySearch"
+              }
+            ]
+          ]
+        }
+      },
+      "DependsOn": "HttpApiIntegrationFuzzySearch"
+    },
+    "OriginalTable": {
+      "Type": "AWS::DynamoDB::Table",
+      "Properties": {
+        "TableName": "zotero-replication-backend-dev2-original",
+        "BillingMode": "PAY_PER_REQUEST",
+        "AttributeDefinitions": [
+          {
+            "AttributeName": "doi",
+            "AttributeType": "S"
+          },
+          {
+            "AttributeName": "doi_hash",
+            "AttributeType": "S"
+          }
+        ],
+        "KeySchema": [
+          {
+            "AttributeName": "doi",
+            "KeyType": "HASH"
+          }
+        ],
+        "GlobalSecondaryIndexes": [
+          {
+            "IndexName": "doi_hash-index",
+            "KeySchema": [
+              {
+                "AttributeName": "doi_hash",
+                "KeyType": "HASH"
+              }
+            ],
+            "Projection": {
+              "ProjectionType": "ALL"
+            }
+          }
+        ]
+      }
+    },
+    "ReplicationTable": {
+      "Type": "AWS::DynamoDB::Table",
+      "Properties": {
+        "TableName": "zotero-replication-backend-dev2-replication",
+        "BillingMode": "PAY_PER_REQUEST",
+        "AttributeDefinitions": [
+          {
+            "AttributeName": "doi",
+            "AttributeType": "S"
+          },
+          {
+            "AttributeName": "doi_hash",
+            "AttributeType": "S"
+          }
+        ],
+        "KeySchema": [
+          {
+            "AttributeName": "doi",
+            "KeyType": "HASH"
+          }
+        ],
+        "GlobalSecondaryIndexes": [
+          {
+            "IndexName": "doi_hash-index",
+            "KeySchema": [
+              {
+                "AttributeName": "doi_hash",
+                "KeyType": "HASH"
+              }
+            ],
+            "Projection": {
+              "ProjectionType": "ALL"
+            }
+          }
+        ]
+      }
+    },
+    "ReproductionTable": {
+      "Type": "AWS::DynamoDB::Table",
+      "Properties": {
+        "TableName": "zotero-replication-backend-dev2-reproduction",
+        "BillingMode": "PAY_PER_REQUEST",
+        "AttributeDefinitions": [
+          {
+            "AttributeName": "doi",
+            "AttributeType": "S"
+          },
+          {
+            "AttributeName": "doi_hash",
+            "AttributeType": "S"
+          }
+        ],
+        "KeySchema": [
+          {
+            "AttributeName": "doi",
+            "KeyType": "HASH"
+          }
+        ],
+        "GlobalSecondaryIndexes": [
+          {
+            "IndexName": "doi_hash-index",
+            "KeySchema": [
+              {
+                "AttributeName": "doi_hash",
+                "KeyType": "HASH"
+              }
+            ],
+            "Projection": {
+              "ProjectionType": "ALL"
+            }
+          }
+        ]
+      }
+    },
+    "SearchIndexTable": {
+      "Type": "AWS::DynamoDB::Table",
+      "Properties": {
+        "TableName": "zotero-replication-backend-dev2-search",
+        "BillingMode": "PAY_PER_REQUEST",
+        "AttributeDefinitions": [
+          {
+            "AttributeName": "chunk_id",
+            "AttributeType": "S"
+          }
+        ],
+        "KeySchema": [
+          {
+            "AttributeName": "chunk_id",
+            "KeyType": "HASH"
+          }
+        ]
+      }
+    }
+  },
+  "Outputs": {
+    "ServerlessDeploymentBucketName": {
+      "Value": {
+        "Ref": "ServerlessDeploymentBucket"
+      },
+      "Export": {
+        "Name": "sls-zotero-replication-backend-dev2-ServerlessDeploymentBucketName"
+      }
+    },
+    "PrefixLookupLambdaFunctionQualifiedArn": {
+      "Description": "Current Lambda function version",
+      "Value": {
+        "Ref": "PrefixLookupLambdaVersiontXbEaTlFGnSIZ3WzSRPS4M2NQV9P9TsEED0FdYjxssw"
+      },
+      "Export": {
+        "Name": "sls-zotero-replication-backend-dev2-PrefixLookupLambdaFunctionQualifiedArn"
+      }
+    },
+    "OriginalLookupLambdaFunctionQualifiedArn": {
+      "Description": "Current Lambda function version",
+      "Value": {
+        "Ref": "OriginalLookupLambdaVersionXax8d9F5z8G4X5wM9FJduK6N56vmmJL7ocVxa4P0"
+      },
+      "Export": {
+        "Name": "sls-zotero-replication-backend-dev2-OriginalLookupLambdaFunctionQualifiedArn"
+      }
+    },
+    "DoiListLambdaFunctionQualifiedArn": {
+      "Description": "Current Lambda function version",
+      "Value": {
+        "Ref": "DoiListLambdaVersiong4E2JsB4REf45fUiBIvS4XoQHCapYarS6SfyBZJ6F0"
+      },
+      "Export": {
+        "Name": "sls-zotero-replication-backend-dev2-DoiListLambdaFunctionQualifiedArn"
+      }
+    },
+    "FilterOptionsLambdaFunctionQualifiedArn": {
+      "Description": "Current Lambda function version",
+      "Value": {
+        "Ref": "FilterOptionsLambdaVersion7gqC9SNnShWUu4fwga4L8uICYpdW6jXvl338mZ1J8"
+      },
+      "Export": {
+        "Name": "sls-zotero-replication-backend-dev2-FilterOptionsLambdaFunctionQualifiedArn"
+      }
+    },
+    "RecordsListLambdaFunctionQualifiedArn": {
+      "Description": "Current Lambda function version",
+      "Value": {
+        "Ref": "RecordsListLambdaVersionjGXfPJXwDMQWaNtLTgAHpIOt0iDv2kbfOL4oOkak"
+      },
+      "Export": {
+        "Name": "sls-zotero-replication-backend-dev2-RecordsListLambdaFunctionQualifiedArn"
+      }
+    },
+    "FuzzySearchLambdaFunctionQualifiedArn": {
+      "Description": "Current Lambda function version",
+      "Value": {
+        "Ref": "FuzzySearchLambdaVersionmOWvdauST5j8hK2rH1ZkBfw1s3Ujiab03KbzjBNE0o"
+      },
+      "Export": {
+        "Name": "sls-zotero-replication-backend-dev2-FuzzySearchLambdaFunctionQualifiedArn"
+      }
+    },
+    "HttpApiId": {
+      "Description": "Id of the HTTP API",
+      "Value": {
+        "Ref": "HttpApi"
+      },
+      "Export": {
+        "Name": "sls-zotero-replication-backend-dev2-HttpApiId"
+      }
+    },
+    "HttpApiUrl": {
+      "Description": "URL of the HTTP API",
+      "Value": {
+        "Fn::Join": [
+          "",
+          [
+            "https://",
+            {
+              "Ref": "HttpApi"
+            },
+            ".execute-api.",
+            {
+              "Ref": "AWS::Region"
+            },
+            ".",
+            {
+              "Ref": "AWS::URLSuffix"
+            }
+          ]
+        ]
+      },
+      "Export": {
+        "Name": "sls-zotero-replication-backend-dev2-HttpApiUrl"
+      }
+    }
+  }
+}

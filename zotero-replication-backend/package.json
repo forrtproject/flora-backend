@@ -1,0 +1,35 @@
+{
+  "name": "zotero-replication-backend",
+  "version": "1.0.0",
+  "description": "Backend for the Zotero Replication Checker (Lambda + DynamoDB)",
+  "main": "dist/handler.js",
+  "scripts": {
+    "build": "serverless package",
+    "deploy": "serverless deploy",
+    "invoke:prefix": "serverless invoke local -f prefixLookup --data '{\"body\":\"{\\\"prefixes\\\":[\\\"a1b\\\"]}\"}'",
+    "invoke:original": "serverless invoke local -f originalLookup --data '{\"body\":\"{\\\"dois\\\":[\\\"10.1234/abc\\\"]}\"}'",
+    "invoke:search": "serverless invoke local -f fuzzySearch --data '{\"body\":\"{\\\"query\\\":\\\"social priming\\\"}\"}'",
+    "clean": "rimraf .serverless dist || rmdir /s /q .serverless dist",
+    "test": "echo \"No tests yet\" && exit 0"
+  },
+  "keywords": [
+    "zotero",
+    "replication",
+    "serverless",
+    "aws",
+    "lambda",
+    "dynamodb"
+  ],
+  "license": "ISC",
+  "devDependencies": {
+    "@types/node": "^24.7.2",
+    "esbuild": "^0.25.10",
+    "serverless": "^3.40.0",
+    "serverless-esbuild": "^1.57.0",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.908.0",
+    "fuse.js": "^7.1.0"
+  }
+}

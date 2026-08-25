@@ -1,0 +1,147 @@
+service: zotero-replication-backend
+frameworkVersion: "3"
+
+provider:
+  name: aws
+  runtime: nodejs24.x
+  region: eu-central-1
+  stage: dev
+
+  # ✅ Env vars available inside ALL Lambda functions
+  environment:
+    # 1) Prefix index table (privacy-preserving lookup by 3-char hash prefix)
+    PREFIX_TABLE: ${self:service}-${sls:stage}-prefix
+
+    # 2) Main data table: ONE ROW PER DOI
+    #    This replaces "original table" as a concept.
+    DOI_TABLE: ${self:service}-${sls:stage}-doi
+
+    # 3) Precomputed search index (compact chunks for fuzzy search)
+    SEARCH_TABLE: ${self:service}-${sls:stage}-search
+
+  # HTTP API gateway (v2) + CORS for Zotero/browser calls
+  httpApi:
+    cors: true
+
+  # ✅ IAM permissions (what Lambdas may do in DynamoDB)
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - dynamodb:GetItem        # Get by primary key
+            - dynamodb:BatchGetItem   # Efficient multi-get for DOI hydration
+          Resource:
+            - arn:aws:dynamodb:${self:provider.region}:*:table/${self:service}-${sls:stage}-prefix
+            - arn:aws:dynamodb:${self:provider.region}:*:table/${self:service}-${sls:stage}-doi
+            - arn:aws:dynamodb:${self:provider.region}:*:table/${self:service}-${sls:stage}-search
+
+functions:
+  # 1️⃣ prefix lookup: prefixes -> DOIs -> full DOI records
+  # URL stays the same:
+  #   GET/POST /v1/prefix-lookup
+  prefixLookup:
+    handler: src/handler.handler
+    events:
+      - httpApi: { path: /v1/prefix-lookup, method: GET }
+      - httpApi: { path: /v1/prefix-lookup, method: POST }
+
+  # 2️⃣ doi lookup (keeps your endpoint name "original-lookup"):
+  # URL stays the same:
+  #   GET/POST /v1/original-lookup
+  originalLookup:
+    handler: src/original.handler
+    events:
+      - httpApi: { path: /v1/original-lookup, method: GET }
+      - httpApi: { path: /v1/original-lookup, method: POST }
+
+  # 3️⃣ list all DOI identifiers (no full records)
+  #   GET /v1/dois
+  doiList:
+    handler: src/dois.handler
+    events:
+      - httpApi: { path: /v1/dois, method: GET }
+
+  # 4️⃣ fuzzy search: search by title, author, year
+  #   GET/POST /v1/search
+  fuzzySearch:
+    handler: src/search.handler
+    timeout: 15
+    events:
+      - httpApi: { path: /v1/search, method: GET }
+      - httpApi: { path: /v1/search, method: POST }
+
+plugins:
+  - serverless-esbuild
+
+custom:
+  esbuild:
+    bundle: true
+    platform: node
+    target: node24
+    sourcemap: true
+    minify: true
+    exclude: ["aws-sdk"]
+    keepNames: true
+
+resources:
+  Resources:
+    # ==========================================================
+    # 📦 TABLE 1: PREFIX INDEX TABLE
+    #
+    # Key: prefix (3-char string)
+    # Value: dois (list of DOI strings)
+    # Example item:
+    #   { "prefix": "198", "dois": ["10.1037/a0012833", ...] }
+    # ==========================================================
+    PrefixIndexTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:service}-${sls:stage}-prefix
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: prefix
+            AttributeType: S
+        KeySchema:
+          - AttributeName: prefix
+            KeyType: HASH
+
+    # ==========================================================
+    # 📦 TABLE 2: DOI RECORD TABLE (ONE ROW PER DOI)
+    #
+    # Key: doi (string)
+    # Value: record (JSON string, your meta/stats/originals/replications)
+    # Example item:
+    #   { "doi": "10.1037/a0012833", "record": "{...json...}" }
+    # ==========================================================
+    DoiRecordTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:service}-${sls:stage}-doi
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: doi
+            AttributeType: S
+        KeySchema:
+          - AttributeName: doi
+            KeyType: HASH
+
+    # ==========================================================
+    # 📦 TABLE 3: SEARCH INDEX (precomputed at ETL time)
+    #
+    # Key: chunk_id (string, "meta" or "0","1","2",...)
+    # Value: data (JSON string)
+    #   "meta" item: { "total_chunks": N }
+    #   chunk items: [{ doi, title, authors, journal, year }, ...]
+    # ==========================================================
+    SearchIndexTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:service}-${sls:stage}-search
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: chunk_id
+            AttributeType: S
+        KeySchema:
+          - AttributeName: chunk_id
+            KeyType: HASH
