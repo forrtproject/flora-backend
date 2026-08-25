@@ -1,4 +1,4 @@
-# FLORA Backend (`zotero-replication-backend`)
+# FLORA Backend 
 
 Serverless backend for the FORRT Replication Checker — the service behind the Zotero
 plugin and [forrt.org](https://forrt.org) that tells you whether a paper in your library
