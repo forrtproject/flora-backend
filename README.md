@@ -146,10 +146,17 @@ Three tables, all `PAY_PER_REQUEST`, named `zotero-replication-backend-<stage>-<
 
 A DOI may hold more than one role in `types` — the same paper can be an original for one
 study and a replication of another. Each record carries `stats` (counts of replications,
-reproductions, and originals, with and without DOIs) plus citation-graph fields
-(`outcome_mix`, `citation_timeline`, `first_replication_year`, `first_replication_outcome`).
-The handlers recompute the citation-graph fields at read time so the shape stays
-consistent even for older rows.
+reproductions, and originals, with and without DOIs) plus derived fields seeded by the
+ETL (`outcome_mix`, `replication_year_counts`, `first_replication_year`,
+`first_replication_outcome`) and by the OpenCitations pipeline (`citation_timeline`,
+`n_citations`).
+
+Those derived fields are stored *inside* `record` but returned at the **top level** of the
+API response, and [src/recordFields.ts](src/recordFields.ts) strips the nested copies on
+the way out so each key ships exactly once. Everything else in `record` — `originals`,
+`replications`, `reproductions`, `stats` — is passed through untouched. The handlers also
+recompute the derived fields at read time, so the response shape stays consistent even for
+rows seeded by an older ETL run.
 
 **`*-search`** — key `chunk_id` (S)
 
