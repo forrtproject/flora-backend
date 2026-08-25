@@ -1,0 +1,8 @@
+/zotero-replication-backend/node_modules
+.env
+/zotero-replication-backend/.serverless
+zotero-replication-backend/.serverless/cloudformation-template-create-stack.json
+zotero-replication-backend/.serverless/cloudformation-template-update-stack.json
+zotero-replication-backend/.serverless/serverless-state.json
+zotero-replication-backend/.serverless/zotero-replication-backend.zip
+/zotero-replication-backend/.serverless
