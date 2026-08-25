@@ -563,9 +563,10 @@ def main():
             "n_unique_original_dois": len(uniq_ori),
         }
 
-        # Citation graph fields (computed from replications)
+        # Counts of replications per year. Not citation counts: the
+        # citation_timeline key belongs to the OpenCitations pipeline.
         outcome_mix: dict[str, int] = {}
-        citation_timeline: dict[str, int] = {}
+        replication_year_counts: dict[str, int] = {}
         first_year: int | None = None
         first_outcome: str | None = None
         for rep in reps:
@@ -576,14 +577,14 @@ def main():
             if rep_year:
                 try:
                     y = int(rep_year)
-                    citation_timeline[str(y)] = citation_timeline.get(str(y), 0) + 1
+                    replication_year_counts[str(y)] = replication_year_counts.get(str(y), 0) + 1
                     if first_year is None or y < first_year:
                         first_year = y
                         first_outcome = outcome
                 except (ValueError, TypeError):
                     pass
         record["record"]["outcome_mix"] = outcome_mix
-        record["record"]["citation_timeline"] = citation_timeline
+        record["record"]["replication_year_counts"] = replication_year_counts
         record["record"]["first_replication_year"] = str(first_year) if first_year is not None else None
         record["record"]["first_replication_outcome"] = first_outcome
 

@@ -1,5 +1,6 @@
 import { DynamoDBClient, GetItemCommand, BatchGetItemCommand } from "@aws-sdk/client-dynamodb";
 import Fuse from "fuse.js";
+import { includeDerivedFields, serializeRecord } from "./recordFields";
 
 const ddb = new DynamoDBClient({});
 const DOI_TABLE = process.env.DOI_TABLE!;
@@ -247,38 +248,17 @@ function filterByOutcomes(records: Record<string, any>, outcomes?: string[]): Re
   return filtered;
 }
 
-function computeCitationGraphFields(rec: any) {
-  const replications: any[] = rec?.record?.replications ?? [];
-  const outcome_mix: Record<string, number> = {};
-  const citation_timeline: Record<string, number> = {};
-  let first_year: number | null = null;
-  let first_outcome: string | null = null;
-
-  for (const rep of replications) {
-    const outcome: string | undefined = rep.outcome;
-    if (outcome) outcome_mix[outcome] = (outcome_mix[outcome] ?? 0) + 1;
-    const y = rep.year != null ? parseInt(String(rep.year), 10) : NaN;
-    if (!isNaN(y)) {
-      citation_timeline[String(y)] = (citation_timeline[String(y)] ?? 0) + 1;
-      if (first_year === null || y < first_year) { first_year = y; first_outcome = outcome ?? null; }
-    }
-  }
-
-  return {
-    outcome_mix,
-    replication_year_counts: citation_timeline,
-    first_replication_year: first_year !== null ? String(first_year) : null,
-    first_replication_outcome: first_outcome,
-  };
-}
-
 function chunk<T>(arr: T[], size: number): T[][] {
   const out: T[][] = [];
   for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
   return out;
 }
 
-async function hydrateDois(dois: string[], score = 0): Promise<Record<string, any>> {
+async function hydrateDois(
+  dois: string[],
+  includeDerived: boolean,
+  score = 0,
+): Promise<Record<string, any>> {
   const out: Record<string, any> = {};
   if (!dois.length) return out;
 
@@ -300,7 +280,7 @@ async function hydrateDois(dois: string[], score = 0): Promise<Record<string, an
         if (!doi) continue;
         if (recStr) {
           const rec = JSON.parse(recStr);
-          out[doi] = { ...rec, score, ...computeCitationGraphFields(rec) };
+          out[doi] = { ...serializeRecord(rec, includeDerived), score };
         }
       }
 
@@ -314,7 +294,10 @@ async function hydrateDois(dois: string[], score = 0): Promise<Record<string, an
   return out;
 }
 
-async function hydrateRecords(hits: FuseHit[]): Promise<Record<string, any>> {
+async function hydrateRecords(
+  hits: FuseHit[],
+  includeDerived: boolean,
+): Promise<Record<string, any>> {
   const scores: Record<string, number> = {};
   const dois: string[] = [];
 
@@ -329,7 +312,7 @@ async function hydrateRecords(hits: FuseHit[]): Promise<Record<string, any>> {
 
   if (!dois.length) return {};
 
-  const out = await hydrateDois(dois);
+  const out = await hydrateDois(dois, includeDerived);
   for (const doi of dois) {
     if (out[doi]) out[doi].score = scores[doi];
   }
@@ -409,6 +392,7 @@ export const handler = async (event: any) => {
     if (method === "OPTIONS") return { statusCode: 200, headers: cors, body: "" };
 
     const { query, mustHave, anyOf, exclude, yearFrom, yearTo, outcomes, paperTypes, limit, offset } = extractSearchParams(event);
+    const includeDerived = includeDerivedFields(event);
 
     const isAdvanced = mustHave.length > 0 || anyOf.length > 0 || exclude.length > 0;
     const hasInput = query || isAdvanced;
@@ -460,7 +444,7 @@ export const handler = async (event: any) => {
     const total = hits.length;
     const page = hits.slice(offset, offset + limit);
 
-    let fullRecords = await hydrateRecords(page);
+    let fullRecords = await hydrateRecords(page, includeDerived);
     fullRecords = filterByPaperTypes(fullRecords, paperTypes);
     fullRecords = filterByOutcomes(fullRecords, outcomes);
 
@@ -482,7 +466,7 @@ export const handler = async (event: any) => {
       }
 
       if (linkedDois.size > 0) {
-        const extra = await hydrateDois([...linkedDois]);
+        const extra = await hydrateDois([...linkedDois], includeDerived);
         Object.assign(fullRecords, extra);
       }
     }

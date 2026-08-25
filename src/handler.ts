@@ -1,4 +1,5 @@
 import { DynamoDBClient, GetItemCommand, BatchGetItemCommand } from "@aws-sdk/client-dynamodb";
+import { includeDerivedFields, serializeRecord } from "./recordFields";
 
 const ddb = new DynamoDBClient({});
 const PREFIX_TABLE = process.env.PREFIX_TABLE!;
@@ -42,28 +43,6 @@ function chunk<T>(arr: T[], size: number): T[][] {
   return out;
 }
 
-function computeCitationGraphFields(rec: any) {
-  const replications: any[] = rec?.record?.replications ?? [];
-  const outcome_mix: Record<string, number> = {};
-  let first_year: number | null = null;
-  let first_outcome: string | null = null;
-
-  for (const rep of replications) {
-    const outcome: string | undefined = rep.outcome;
-    if (outcome) outcome_mix[outcome] = (outcome_mix[outcome] ?? 0) + 1;
-    const y = rep.year != null ? parseInt(String(rep.year), 10) : NaN;
-    if (!isNaN(y)) {
-      if (first_year === null || y < first_year) { first_year = y; first_outcome = outcome ?? null; }
-    }
-  }
-
-  return {
-    outcome_mix,
-    first_replication_year: first_year !== null ? String(first_year) : null,
-    first_replication_outcome: first_outcome,
-  };
-}
-
 function decodeDoisAttr(item: any): string[] {
   if (item?.dois?.L) return item.dois.L.map((x: any) => x?.S).filter(Boolean);
   if (item?.dois?.S) {
@@ -75,7 +54,10 @@ function decodeDoisAttr(item: any): string[] {
   return [];
 }
 
-async function batchGetDois(dois: string[]): Promise<Record<string, any | null>> {
+async function batchGetDois(
+  dois: string[],
+  includeDerived: boolean,
+): Promise<Record<string, any | null>> {
   const out: Record<string, any | null> = {};
   for (const d of dois) out[d] = null;
 
@@ -96,7 +78,7 @@ async function batchGetDois(dois: string[]): Promise<Record<string, any | null>>
         const doi = it.doi?.S;
         const recStr = it.record?.S;
         if (!doi) continue;
-        if (recStr) { const rec = JSON.parse(recStr); out[doi] = { ...rec, ...computeCitationGraphFields(rec) }; }
+        if (recStr) { const rec = JSON.parse(recStr); out[doi] = serializeRecord(rec, includeDerived); }
       }
 
       requestItems = resp.UnprocessedKeys && Object.keys(resp.UnprocessedKeys).length ? resp.UnprocessedKeys : null;
@@ -139,7 +121,7 @@ export const handler = async (event: any) => {
 
     // 2) hydrate all DOIs
     const allDois = Array.from(new Set(Object.values(prefixToDois).flat())).slice(0, 5000);
-    const doiToRecord = await batchGetDois(allDois);
+    const doiToRecord = await batchGetDois(allDois, includeDerivedFields(event));
 
     // 3) results per prefix (return parsed DOI records directly)
     const results: Record<string, any[]> = {};
