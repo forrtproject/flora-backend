@@ -19,6 +19,9 @@ provider:
     # 3) Precomputed search index (compact chunks for fuzzy search)
     SEARCH_TABLE: ${self:service}-${sls:stage}-search
 
+    # 4) Client-created DOI sets (shareable id -> list of DOIs)
+    SETS_TABLE: ${self:service}-${sls:stage}-sets
+
   # HTTP API gateway (v2) + CORS for Zotero/browser calls
   httpApi:
     cors: true
@@ -35,6 +38,14 @@ provider:
             - arn:aws:dynamodb:${self:provider.region}:*:table/${self:service}-${sls:stage}-prefix
             - arn:aws:dynamodb:${self:provider.region}:*:table/${self:service}-${sls:stage}-doi
             - arn:aws:dynamodb:${self:provider.region}:*:table/${self:service}-${sls:stage}-search
+
+        # Sets is the only writable table — the read endpoints have no access to it.
+        - Effect: Allow
+          Action:
+            - dynamodb:GetItem
+            - dynamodb:PutItem
+          Resource:
+            - arn:aws:dynamodb:${self:provider.region}:*:table/${self:service}-${sls:stage}-sets
 
 functions:
   # 1️⃣ prefix lookup: prefixes -> DOIs -> full DOI records
@@ -70,6 +81,19 @@ functions:
     events:
       - httpApi: { path: /v1/search, method: GET }
       - httpApi: { path: /v1/search, method: POST }
+
+  # 5️⃣ doi sets: store a list of DOIs, get it back by id
+  #   POST /v1/sets
+  #   GET  /v1/sets/{id}
+  setsCreate:
+    handler: src/sets.create
+    events:
+      - httpApi: { path: /v1/sets, method: POST }
+
+  setsGet:
+    handler: src/sets.get
+    events:
+      - httpApi: { path: "/v1/sets/{id}", method: GET }
 
 plugins:
   - serverless-esbuild
@@ -145,3 +169,28 @@ resources:
         KeySchema:
           - AttributeName: chunk_id
             KeyType: HASH
+
+    # ==========================================================
+    # 📦 TABLE 4: DOI SETS (written by the API, not the ETL)
+    #
+    # Key: id (8-char hex string)
+    # Value: dois (JSON string), count (N), created (ISO 8601 string),
+    #        ttl (N, epoch seconds — 30 days after creation)
+    # Example item:
+    #   { "id": "ab12cd34", "dois": "[\"10.1037/xge0001132\"]",
+    #     "count": 1, "created": "2026-08-27T10:14:02Z", "ttl": 1788000842 }
+    # ==========================================================
+    DoiSetsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:service}-${sls:stage}-sets
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: id
+            AttributeType: S
+        KeySchema:
+          - AttributeName: id
+            KeyType: HASH
+        TimeToLiveSpecification:
+          AttributeName: ttl
+          Enabled: true

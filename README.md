@@ -24,16 +24,17 @@ AWS Lambda.
 ```
 FLoRA CSV ──► etl/seed_prefixes.py ──► DynamoDB ─┬─ *-prefix   (hash prefix → DOIs)
                                                 ├─ *-doi      (DOI → full record)
-                                                └─ *-search   (chunked search index)
+                                                ├─ *-search   (chunked search index)
+                                                └─ *-sets     (short id → DOIs, written by the API)
                                                        │
 Zotero plugin / forrt.org ──► HTTP API (v2) ──► Lambda ─┘
 ```
 
 - **Runtime:** Node.js 24 on AWS Lambda, region `eu-central-1`
 - **Gateway:** API Gateway HTTP API (v2), CORS enabled
-- **Storage:** three on-demand DynamoDB tables, no provisioned capacity
+- **Storage:** four on-demand DynamoDB tables, no provisioned capacity
 - **Build:** Serverless Framework v3 with `serverless-esbuild` (bundled, minified, source-mapped)
-- **IAM:** the Lambda role is limited to `GetItem` and `BatchGetItem` on the three tables — the API can never write
+- **IAM:** the Lambda role has `GetItem` and `BatchGetItem` on the three data tables and nothing else — the FLoRA data itself can never be written by the API. `PutItem` is granted only on `*-sets`, which holds client-submitted DOI lists.
 
 Privacy is the reason for the prefix table. The Zotero client never sends the DOIs in
 your library; it hashes each one and sends only the first three characters of the hash.
@@ -50,6 +51,8 @@ Base URL is the API Gateway endpoint printed by `serverless deploy`.
 | `GET`/`POST` | `/v1/original-lookup` | DOIs → full DOI records |
 | `GET` | `/v1/dois` | Every DOI in the database (identifiers only) |
 | `GET`/`POST` | `/v1/search` | Fuzzy search over title, authors, and year |
+| `POST` | `/v1/sets` | Store a list of DOIs, get back a short id |
+| `GET` | `/v1/sets/{id}` | Read a stored list back (expires after 30 days) |
 
 Every endpoint accepts parameters either as a JSON body or as a query string, handles
 `OPTIONS` preflight, and returns `{ "error": ... }` with a 400 or 500 on failure.
@@ -125,9 +128,49 @@ Setting `paperTypes` also expands the result set with linked papers in both dire
 an original pulls in its replications and reproductions, a replication pulls in its
 originals.
 
+### `POST /v1/sets`
+
+Stores a list of DOIs under a short id so a large selection can travel as `?set=ab12cd34`
+instead of a query string long enough to trip the URI length limit. Sets are scratch
+space, not permalinks: the client re-`POST`s the list whenever it needs an id.
+
+```bash
+curl -X POST "$API/v1/sets" \
+  -H 'Content-Type: application/json' \
+  -d '{"dois": ["10.1037/xge0001132", "10.1016/j.jesp.2015.10.012"]}'
+```
+
+```json
+{ "id": "ab12cd34", "count": 312, "created": "2026-08-27T10:14:02Z", "expires": "2026-09-26T10:14:02Z" }
+```
+
+DOIs are normalised and deduplicated the same way `/v1/original-lookup` does them, so
+`count` can be lower than the number sent. Capped at 5000 DOIs per set. The body must be
+JSON with a non-empty `dois` array — no query-string form.
+
+### `GET /v1/sets/{id}`
+
+```json
+{ "id": "ab12cd34", "dois": ["10.1037/xge0001132", "..."], "count": 312, "created": "2026-08-27T10:14:02Z", "expires": "2026-09-26T10:14:02Z" }
+```
+
+A set is immutable but not permanent, so the `immutable` cache header carries a `max-age`
+of whatever is left of its 30 days — never long enough to outlive the record.
+
+Unknown, malformed, and expired ids all answer `404` with the same body:
+
+```json
+{ "error": "This link has expired. Please generate it again.", "code": "set_expired" }
+```
+
+They share one response because once DynamoDB has swept a row, an expired id and one that
+never existed are indistinguishable — and the client's move is the same either way.
+**Treat `404` as "re-`POST` the list", not as an error.** Branch on `code`, not on the
+`error` sentence, which is meant for humans and may be reworded.
+
 ## Data model
 
-Three tables, all `PAY_PER_REQUEST`, named `zotero-replication-backend-<stage>-<suffix>`:
+Four tables, all `PAY_PER_REQUEST`, named `zotero-replication-backend-<stage>-<suffix>`:
 
 **`*-prefix`** — key `prefix` (S)
 
@@ -169,6 +212,18 @@ rows seeded by an older ETL run.
 every chunk on a cold start and caches the assembled index — and the built Fuse instance —
 in memory for one hour.
 
+**`*-sets`** — key `id` (S). The only table the API writes to, and the only one the ETL
+does not touch. `dois` is a JSON *string*, like `record` above.
+
+```json
+{ "id": "ab12cd34", "dois": "[\"10.1037/xge0001132\"]", "count": 1,
+  "created": "2026-08-27T10:14:02Z", "ttl": 1790503242 }
+```
+
+Ids are 8 random hex characters, written with `attribute_not_exists(id)` so a collision
+retries rather than overwriting an existing set. `ttl` is epoch seconds, 30 days after
+creation, and DynamoDB TTL is enabled on the table.
+
 ## Getting started
 
 Requirements: Node.js 24+, an AWS account, and credentials with permission to deploy
@@ -185,9 +240,10 @@ Invoke a function locally against your deployed tables:
 npm run invoke:prefix     # prefixLookup with {"prefixes":["a1b"]}
 npm run invoke:original   # originalLookup with {"dois":["10.1234/abc"]}
 npm run invoke:search     # fuzzySearch with {"query":"social priming"}
+npm run invoke:sets       # setsCreate with {"dois":["10.1234/abc"]}
 ```
 
-Local invocation needs `PREFIX_TABLE`, `DOI_TABLE`, and `SEARCH_TABLE` in the
+Local invocation needs `PREFIX_TABLE`, `DOI_TABLE`, `SEARCH_TABLE`, and `SETS_TABLE` in the
 environment; `serverless invoke local` reads them from `serverless.yml`, so the tables
 must already exist in your account.
 
@@ -199,7 +255,7 @@ npm run deploy    # serverless deploy — creates/updates the whole stack
 npm run clean     # remove .serverless and dist
 ```
 
-The first deploy creates the three DynamoDB tables along with the functions, then prints
+The first deploy creates the four DynamoDB tables along with the functions, then prints
 the API Gateway base URL. Deploy to another stage with
 `npx serverless deploy --stage prod` — table names carry the stage, so stages are fully
 isolated.
@@ -243,6 +299,9 @@ src/
   original.ts   originalLookup — GET/POST /v1/original-lookup
   dois.ts       doiList        — GET      /v1/dois
   search.ts     fuzzySearch    — GET/POST /v1/search
+  sets.ts       setsCreate     — POST     /v1/sets
+                setsGet        — GET      /v1/sets/{id}
+  doi.ts        DOI normalisation shared by the lookup endpoints
 etl/
   seed_prefixes.py             FLoRA CSV → DynamoDB
 serverless.yml                 Functions, routes, IAM, table definitions
@@ -263,6 +322,10 @@ tsconfig.json
   the hour.
 - **`record` is a JSON string.** Clients must `JSON.parse` the inner payload — the handlers
   do this for you on the way out, but the table itself stores text.
+- **Sets expire after 30 days,** and `GET /v1/sets/{id}` enforces that itself rather than
+  trusting the table. DynamoDB deletes expired items lazily — up to ~48h late — so a swept-late
+  row would otherwise stay readable past its date. The handler 404s the moment `ttl` passes;
+  the sweeper only reclaims the storage.
 - No test suite yet: `npm test` is a stub.
 
 ## License
