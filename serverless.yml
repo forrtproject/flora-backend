@@ -19,6 +19,9 @@ provider:
     # 3) Precomputed search index (compact chunks for fuzzy search)
     SEARCH_TABLE: ${self:service}-${sls:stage}-search
 
+    # 4) Client-created DOI sets (shareable id -> list of DOIs)
+    SETS_TABLE: ${self:service}-${sls:stage}-sets
+
   # HTTP API gateway (v2) + CORS for Zotero/browser calls
   httpApi:
     cors: true
@@ -35,6 +38,14 @@ provider:
             - arn:aws:dynamodb:${self:provider.region}:*:table/${self:service}-${sls:stage}-prefix
             - arn:aws:dynamodb:${self:provider.region}:*:table/${self:service}-${sls:stage}-doi
             - arn:aws:dynamodb:${self:provider.region}:*:table/${self:service}-${sls:stage}-search
+
+        # Sets is the only writable table — the read endpoints have no access to it.
+        - Effect: Allow
+          Action:
+            - dynamodb:GetItem
+            - dynamodb:PutItem
+          Resource:
+            - arn:aws:dynamodb:${self:provider.region}:*:table/${self:service}-${sls:stage}-sets
 
 functions:
   # 1️⃣ prefix lookup: prefixes -> DOIs -> full DOI records
@@ -70,6 +81,19 @@ functions:
     events:
       - httpApi: { path: /v1/search, method: GET }
       - httpApi: { path: /v1/search, method: POST }
+
+  # 5️⃣ doi sets: store a list of DOIs, get it back by id
+  #   POST /v1/sets       -> { id: "<8 hex>.<key>" }
+  #   GET  /v1/sets/{id}  <- the same id, key included
+  setsCreate:
+    handler: src/sets.create
+    events:
+      - httpApi: { path: /v1/sets, method: POST }
+
+  setsGet:
+    handler: src/sets.get
+    events:
+      - httpApi: { path: "/v1/sets/{id}", method: GET }
 
 plugins:
   - serverless-esbuild
@@ -145,3 +169,32 @@ resources:
         KeySchema:
           - AttributeName: chunk_id
             KeyType: HASH
+
+    # ==========================================================
+    # 📦 TABLE 4: DOI SETS (written by the API, not the ETL)
+    #
+    # Key: id (8-char hex string)
+    # Value: data (AES-256-GCM ciphertext, base64), iv (base64), tag (base64),
+    #        ttl (N, epoch seconds — 30 days after creation)
+    #
+    # The DOIs, their count, and the creation time are all inside the ciphertext. The
+    # per-set key is generated in the Lambda and handed to the client as part of the
+    # share token — it is never written here, so this table alone decrypts to nothing.
+    # Example item:
+    #   { "id": "ab12cd34", "data": "k3Qh...", "iv": "2Fh1...", "tag": "9aQ...",
+    #     "ttl": 1788000842 }
+    # ==========================================================
+    DoiSetsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:service}-${sls:stage}-sets
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: id
+            AttributeType: S
+        KeySchema:
+          - AttributeName: id
+            KeyType: HASH
+        TimeToLiveSpecification:
+          AttributeName: ttl
+          Enabled: true

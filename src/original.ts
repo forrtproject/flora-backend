@@ -1,5 +1,6 @@
 import { DynamoDBClient, BatchGetItemCommand } from "@aws-sdk/client-dynamodb";
 import { includeDerivedFields, serializeRecord } from "./recordFields";
+import { normDoi } from "./doi";
 
 const ddb = new DynamoDBClient({});
 const DOI_TABLE = process.env.DOI_TABLE!;
@@ -9,21 +10,6 @@ const cors = {
   "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type",
 };
-
-function normDoi(s: string) {
-  if (!s) return "";
-  let x = s.trim().toLowerCase();
-  for (const p of [
-    "https://doi.org/",
-    "http://doi.org/",
-    "https://dx.doi.org/",
-    "http://dx.doi.org/",
-    "doi:",
-  ]) {
-    x = x.replace(p, "");
-  }
-  return x.trim();
-}
 
 function extractDois(event: any): string[] {
   let dois: string[] = [];

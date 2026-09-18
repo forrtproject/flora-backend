@@ -24,16 +24,17 @@ AWS Lambda.
 ```
 FLoRA CSV ──► etl/seed_prefixes.py ──► DynamoDB ─┬─ *-prefix   (hash prefix → DOIs)
                                                 ├─ *-doi      (DOI → full record)
-                                                └─ *-search   (chunked search index)
+                                                ├─ *-search   (chunked search index)
+                                                └─ *-sets     (short id → encrypted DOIs, written by the API)
                                                        │
 Zotero plugin / forrt.org ──► HTTP API (v2) ──► Lambda ─┘
 ```
 
 - **Runtime:** Node.js 24 on AWS Lambda, region `eu-central-1`
 - **Gateway:** API Gateway HTTP API (v2), CORS enabled
-- **Storage:** three on-demand DynamoDB tables, no provisioned capacity
+- **Storage:** four on-demand DynamoDB tables, no provisioned capacity
 - **Build:** Serverless Framework v3 with `serverless-esbuild` (bundled, minified, source-mapped)
-- **IAM:** the Lambda role is limited to `GetItem` and `BatchGetItem` on the three tables — the API can never write
+- **IAM:** the Lambda role has `GetItem` and `BatchGetItem` on the three data tables and nothing else — the FLoRA data itself can never be written by the API. `PutItem` is granted only on `*-sets`, which holds client-submitted DOI lists — encrypted, with the key held by the client rather than the table.
 
 Privacy is the reason for the prefix table. The Zotero client never sends the DOIs in
 your library; it hashes each one and sends only the first three characters of the hash.
@@ -50,6 +51,8 @@ Base URL is the API Gateway endpoint printed by `serverless deploy`.
 | `GET`/`POST` | `/v1/original-lookup` | DOIs → full DOI records |
 | `GET` | `/v1/dois` | Every DOI in the database (identifiers only) |
 | `GET`/`POST` | `/v1/search` | Fuzzy search over title, authors, and year |
+| `POST` | `/v1/sets` | Store a list of DOIs, get back a short id |
+| `GET` | `/v1/sets/{id}` | Read a stored list back (expires after 30 days; `id` carries the key) |
 
 Every endpoint accepts parameters either as a JSON body or as a query string, handles
 `OPTIONS` preflight, and returns `{ "error": ... }` with a 400 or 500 on failure.
@@ -125,9 +128,88 @@ Setting `paperTypes` also expands the result set with linked papers in both dire
 an original pulls in its replications and reproductions, a replication pulls in its
 originals.
 
+### `POST /v1/sets`
+
+Stores a list of DOIs under a short id so a large selection can travel as `?set=<id>`
+instead of a query string long enough to trip the URI length limit. Sets are scratch
+space, not permalinks: the client re-`POST`s the list whenever it needs an id.
+
+```bash
+curl -X POST "$API/v1/sets" \
+  -H 'Content-Type: application/json' \
+  -d '{"dois": ["10.1037/xge0001132", "10.1016/j.jesp.2015.10.012"]}'
+```
+
+```json
+{ "id": "ab12cd34.hT9v1RkQ0s_bXm4pE7ZLn2yWgC8jUdA6oIvF3rKqNxM", "count": 312,
+  "created": "2026-08-27T10:14:02Z", "expires": "2026-09-26T10:14:02Z" }
+```
+
+The `id` is a share token in two parts: the row id, then the AES-256-GCM key that the list
+was encrypted with. Pass it back whole — see [Set encryption](#set-encryption). It is safe
+in a URL (unreserved characters only) and roughly 52 characters long.
+
+DOIs are normalised and deduplicated the same way `/v1/original-lookup` does them, so
+`count` can be lower than the number sent. Capped at 5000 DOIs per set. The body must be
+JSON with a non-empty `dois` array — no query-string form.
+
+### `GET /v1/sets/{id}`
+
+```json
+{ "id": "ab12cd34.hT9v...", "dois": ["10.1037/xge0001132", "..."], "count": 312, "created": "2026-08-27T10:14:02Z", "expires": "2026-09-26T10:14:02Z" }
+```
+
+A set is immutable but not permanent, so the `immutable` cache header carries a `max-age`
+of whatever is left of its 30 days — never long enough to outlive the record. The cache is
+`private` rather than `public`: the URL carries the decryption key, so no shared proxy or
+CDN should be keeping a copy of the answer.
+
+Unknown, malformed, and expired ids all answer `404` with the same body:
+
+```json
+{ "error": "This link has expired. Please generate it again.", "code": "set_expired" }
+```
+
+They share one response because once DynamoDB has swept a row, an expired id and one that
+never existed are indistinguishable — and the client's move is the same either way. A token
+with the wrong or missing key answers the same way on purpose, so the endpoint cannot be
+used to tell a valid key from an invalid one.
+**Treat `404` as "re-`POST` the list", not as an error.** Branch on `code`, not on the
+`error` sentence, which is meant for humans and may be reworded.
+
+### Set encryption
+
+Submitted DOI lists are user data, so a set is encrypted before it is stored and the
+server keeps no way to read it back on its own.
+
+Each `POST /v1/sets` generates a fresh 256-bit key — nothing is reused between sets, so one
+leaked key exposes one list and no others. The DOIs, their count, and the creation time are
+sealed into a single AES-256-GCM payload under that key, and the row that lands in DynamoDB
+holds only the ciphertext, the IV, the auth tag, and the plaintext `ttl` that DynamoDB needs
+in order to sweep it:
+
+```json
+{ "id": "ab12cd34", "data": "k3Qh...", "iv": "2Fh1...", "tag": "9aQ...", "ttl": 1788000842 }
+```
+
+The key is never written anywhere. It leaves in the `POST` response as the second half of
+the token and comes back in the `GET` path, which is the only reason the server can decrypt
+at all. A dump of the table — a backup, a misconfigured IAM policy, a snapshot handed to
+someone — decrypts to nothing. GCM also authenticates: a row edited in place fails its tag
+check and answers `404` rather than returning altered DOIs.
+
+Two consequences worth designing around:
+
+- **Losing the token loses the set.** There is no recovery path and no support override.
+  That is the point, and it is cheap here because a client can always re-`POST` the list.
+- **The key is in the URL path**, so it reaches anywhere that URL reaches: API Gateway
+  access logs if you enable them, browser history, a `Referer` header on outbound links.
+  Keep set URLs out of logs you retain, and prefer `fetch` over navigation when the client
+  can.
+
 ## Data model
 
-Three tables, all `PAY_PER_REQUEST`, named `zotero-replication-backend-<stage>-<suffix>`:
+Four tables, all `PAY_PER_REQUEST`, named `zotero-replication-backend-<stage>-<suffix>`:
 
 **`*-prefix`** — key `prefix` (S)
 
@@ -169,6 +251,20 @@ rows seeded by an older ETL run.
 every chunk on a cold start and caches the assembled index — and the built Fuse instance —
 in memory for one hour.
 
+**`*-sets`** — key `id` (S). The only table the API writes to, and the only one the ETL
+does not touch. The DOIs, their count, and the creation time live inside `data` as one
+AES-256-GCM ciphertext; see [Set encryption](#set-encryption) for where the key goes.
+
+```json
+{ "id": "ab12cd34", "data": "k3Qh...", "iv": "2Fh1...", "tag": "9aQ...",
+  "ttl": 1790503242 }
+```
+
+Ids are 8 random hex characters, written with `attribute_not_exists(id)` so a collision
+retries rather than overwriting an existing set. `ttl` is epoch seconds, 30 days after
+creation, and DynamoDB TTL is enabled on the table — it stays in plaintext because
+DynamoDB itself has to read it to sweep the row.
+
 ## Getting started
 
 Requirements: Node.js 24+, an AWS account, and credentials with permission to deploy
@@ -185,9 +281,11 @@ Invoke a function locally against your deployed tables:
 npm run invoke:prefix     # prefixLookup with {"prefixes":["a1b"]}
 npm run invoke:original   # originalLookup with {"dois":["10.1234/abc"]}
 npm run invoke:search     # fuzzySearch with {"query":"social priming"}
+npm run invoke:sets       # setsCreate with {"dois":["10.1234/abc"]}
+                          # prints an id like "ab12cd34.<key>" — pass it back whole to setsGet
 ```
 
-Local invocation needs `PREFIX_TABLE`, `DOI_TABLE`, and `SEARCH_TABLE` in the
+Local invocation needs `PREFIX_TABLE`, `DOI_TABLE`, `SEARCH_TABLE`, and `SETS_TABLE` in the
 environment; `serverless invoke local` reads them from `serverless.yml`, so the tables
 must already exist in your account.
 
@@ -199,7 +297,7 @@ npm run deploy    # serverless deploy — creates/updates the whole stack
 npm run clean     # remove .serverless and dist
 ```
 
-The first deploy creates the three DynamoDB tables along with the functions, then prints
+The first deploy creates the four DynamoDB tables along with the functions, then prints
 the API Gateway base URL. Deploy to another stage with
 `npx serverless deploy --stage prod` — table names carry the stage, so stages are fully
 isolated.
@@ -243,6 +341,10 @@ src/
   original.ts   originalLookup — GET/POST /v1/original-lookup
   dois.ts       doiList        — GET      /v1/dois
   search.ts     fuzzySearch    — GET/POST /v1/search
+  sets.ts       setsCreate     — POST     /v1/sets
+                setsGet        — GET      /v1/sets/{id}
+  doi.ts        DOI normalisation shared by the lookup endpoints
+  crypto.ts     AES-256-GCM seal/open and key encoding, used by sets.ts
 etl/
   seed_prefixes.py             FLoRA CSV → DynamoDB
 serverless.yml                 Functions, routes, IAM, table definitions
@@ -263,6 +365,13 @@ tsconfig.json
   the hour.
 - **`record` is a JSON string.** Clients must `JSON.parse` the inner payload — the handlers
   do this for you on the way out, but the table itself stores text.
+- **Sets expire after 30 days,** and `GET /v1/sets/{id}` enforces that itself rather than
+  trusting the table. DynamoDB deletes expired items lazily — up to ~48h late — so a swept-late
+  row would otherwise stay readable past its date. The handler 404s the moment `ttl` passes;
+  the sweeper only reclaims the storage.
+- **A set id without its key is useless,** including to the server. Truncating the token,
+  logging only the first half, or storing the id in a database without the key all lose the
+  set permanently. Treat the whole string as one opaque value.
 - No test suite yet: `npm test` is a stub.
 
 ## License
