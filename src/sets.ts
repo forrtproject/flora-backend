@@ -6,6 +6,7 @@ import {
   ConditionalCheckFailedException,
 } from "@aws-sdk/client-dynamodb";
 import { normDoi } from "./doi";
+import { KEY_CHARS, decodeKey, encodeKey, newKey, open, seal } from "./crypto";
 
 const ddb = new DynamoDBClient({});
 const SETS_TABLE = process.env.SETS_TABLE!;
@@ -13,6 +14,9 @@ const SETS_TABLE = process.env.SETS_TABLE!;
 const MAX_DOIS = 5000;
 const ID_ATTEMPTS = 5;
 const TTL_SECONDS = 30 * 24 * 60 * 60;
+
+/** `<8 hex id>.<base64url key>` — the id addresses the row, the key never reaches the table. */
+const TOKEN_RE = new RegExp(`^([0-9a-f]{8})\\.([A-Za-z0-9_-]{${KEY_CHARS}})$`);
 
 const cors = {
   "Access-Control-Allow-Origin": "*",
@@ -36,8 +40,9 @@ function newId() {
 }
 
 /**
- * A missing row is indistinguishable from one DynamoDB has already swept, so an unknown
- * id gets the same answer as an expired one: the client's move is to re-POST either way.
+ * A missing row is indistinguishable from one DynamoDB has already swept, and a wrong key
+ * is deliberately given the same answer so the endpoint is not an oracle for guessing keys.
+ * The client's move is to re-POST in every one of those cases.
  */
 const expired = () =>
   json(404, {
@@ -75,10 +80,15 @@ export const create = async (event: any) => {
     const now = new Date();
     const created = isoSeconds(now);
     const expiresAt = Math.floor(now.getTime() / 1000) + TTL_SECONDS;
+
+    // Everything the caller submitted goes inside the sealed payload; the row keeps only
+    // what DynamoDB itself has to read, which is the key and the TTL attribute.
+    const key = newKey();
+    const sealed = seal(JSON.stringify({ dois, count: dois.length, created }), key);
     const item = {
-      dois: { S: JSON.stringify(dois) },
-      count: { N: String(dois.length) },
-      created: { S: created },
+      data: { S: sealed.ciphertext },
+      iv: { S: sealed.iv },
+      tag: { S: sealed.tag },
       ttl: { N: String(expiresAt) },
     };
 
@@ -93,7 +103,7 @@ export const create = async (event: any) => {
           }),
         );
         return json(200, {
-          id,
+          id: `${id}.${encodeKey(key)}`,
           count: dois.length,
           created,
           expires: isoSeconds(new Date(expiresAt * 1000)),
@@ -117,8 +127,14 @@ export const get = async (event: any) => {
     const method = event?.requestContext?.http?.method || event?.httpMethod || "GET";
     if (method === "OPTIONS") return { statusCode: 200, headers: cors, body: "" };
 
-    const id = String(event?.pathParameters?.id ?? "").toLowerCase();
-    if (!/^[0-9a-f]{8}$/.test(id)) return expired();
+    const token = String(event?.pathParameters?.id ?? "");
+    const parts = TOKEN_RE.exec(token);
+    if (!parts) return expired();
+
+    const id = parts[1]!;
+    const encodedKey = parts[2]!;
+    const key = decodeKey(encodedKey);
+    if (!key) return expired();
 
     const resp = await ddb.send(
       new GetItemCommand({ TableName: SETS_TABLE, Key: { id: { S: id } } }),
@@ -130,19 +146,30 @@ export const get = async (event: any) => {
     const expiresAt = Number(resp.Item.ttl?.N ?? 0) || nowSeconds + TTL_SECONDS;
     if (expiresAt <= nowSeconds) return expired();
 
-    const dois: string[] = JSON.parse(resp.Item.dois?.S ?? "[]");
+    const plaintext = open(
+      {
+        ciphertext: resp.Item.data?.S ?? "",
+        iv: resp.Item.iv?.S ?? "",
+        tag: resp.Item.tag?.S ?? "",
+      },
+      key,
+    );
+    if (plaintext === null) return expired();
 
-    // A set never changes, so it is cacheable right up to the moment it expires.
+    const payload = JSON.parse(plaintext) as { dois: string[]; count: number; created: string };
+
+    // A set never changes, so it is cacheable right up to the moment it expires — but the
+    // URL carries the key, so only the one browser that holds the link may keep a copy.
     return json(
       200,
       {
-        id,
-        dois,
-        count: Number(resp.Item.count?.N ?? dois.length),
-        created: resp.Item.created?.S ?? null,
+        id: token,
+        dois: payload.dois,
+        count: payload.count ?? payload.dois.length,
+        created: payload.created ?? null,
         expires: isoSeconds(new Date(expiresAt * 1000)),
       },
-      { "Cache-Control": `public, max-age=${expiresAt - nowSeconds}, immutable` },
+      { "Cache-Control": `private, max-age=${expiresAt - nowSeconds}, immutable` },
     );
   } catch (err: any) {
     console.error("sets get error:", err);

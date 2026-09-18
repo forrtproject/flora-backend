@@ -83,8 +83,8 @@ functions:
       - httpApi: { path: /v1/search, method: POST }
 
   # 5️⃣ doi sets: store a list of DOIs, get it back by id
-  #   POST /v1/sets
-  #   GET  /v1/sets/{id}
+  #   POST /v1/sets       -> { id: "<8 hex>.<key>" }
+  #   GET  /v1/sets/{id}  <- the same id, key included
   setsCreate:
     handler: src/sets.create
     events:
@@ -174,11 +174,15 @@ resources:
     # 📦 TABLE 4: DOI SETS (written by the API, not the ETL)
     #
     # Key: id (8-char hex string)
-    # Value: dois (JSON string), count (N), created (ISO 8601 string),
+    # Value: data (AES-256-GCM ciphertext, base64), iv (base64), tag (base64),
     #        ttl (N, epoch seconds — 30 days after creation)
+    #
+    # The DOIs, their count, and the creation time are all inside the ciphertext. The
+    # per-set key is generated in the Lambda and handed to the client as part of the
+    # share token — it is never written here, so this table alone decrypts to nothing.
     # Example item:
-    #   { "id": "ab12cd34", "dois": "[\"10.1037/xge0001132\"]",
-    #     "count": 1, "created": "2026-08-27T10:14:02Z", "ttl": 1788000842 }
+    #   { "id": "ab12cd34", "data": "k3Qh...", "iv": "2Fh1...", "tag": "9aQ...",
+    #     "ttl": 1788000842 }
     # ==========================================================
     DoiSetsTable:
       Type: AWS::DynamoDB::Table
