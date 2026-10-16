@@ -9,7 +9,7 @@
     "invoke:prefix": "serverless invoke local -f prefixLookup --data '{\"body\":\"{\\\"prefixes\\\":[\\\"a1b\\\"]}\"}'",
     "invoke:original": "serverless invoke local -f originalLookup --data '{\"body\":\"{\\\"dois\\\":[\\\"10.1234/abc\\\"]}\"}'",
     "invoke:search": "serverless invoke local -f fuzzySearch --data '{\"body\":\"{\\\"query\\\":\\\"social priming\\\"}\"}'",
-    "invoke:sets": "serverless invoke local -f setsCreate --data '{\"body\":\"{\\\"dois\\\":[\\\"10.1234/abc\\\"]}\"}'",
+    "invoke:sets": "serverless invoke local -f setsCreate --data '{\"body\":\"{\\\"data\\\":\\\"AAAAAAAAAAAAAAAAAAAAAAA\\\",\\\"iv\\\":\\\"AAAAAAAAAAAAAAAA\\\"}\"}'",
     "clean": "rimraf .serverless dist || rmdir /s /q .serverless dist",
     "test": "echo \"No tests yet\" && exit 0"
   },
