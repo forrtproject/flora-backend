@@ -82,9 +82,9 @@ functions:
       - httpApi: { path: /v1/search, method: GET }
       - httpApi: { path: /v1/search, method: POST }
 
-  # 5️⃣ doi sets: store a list of DOIs, get it back by id
-  #   POST /v1/sets       -> { id: "<8 hex>.<key>" }
-  #   GET  /v1/sets/{id}  <- the same id, key included
+  # 5️⃣ doi sets: store a browser-encrypted DOI list, get the ciphertext back by id
+  #   POST /v1/sets       { data, iv } -> { id: "<8 hex>" }
+  #   GET  /v1/sets/{id}  -> { data, iv } (the key stays in the link's #fragment)
   setsCreate:
     handler: src/sets.create
     events:

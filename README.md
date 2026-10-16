@@ -1,4 +1,4 @@
-# FLORA Backend 
+# FLORA Backend
 
 Serverless backend for the FORRT Replication Checker — the service behind the Zotero
 plugin and [forrt.org](https://forrt.org) that tells you whether a paper in your library
@@ -34,7 +34,7 @@ Zotero plugin / forrt.org ──► HTTP API (v2) ──► Lambda ─┘
 - **Gateway:** API Gateway HTTP API (v2), CORS enabled
 - **Storage:** four on-demand DynamoDB tables, no provisioned capacity
 - **Build:** Serverless Framework v3 with `serverless-esbuild` (bundled, minified, source-mapped)
-- **IAM:** the Lambda role has `GetItem` and `BatchGetItem` on the three data tables and nothing else — the FLoRA data itself can never be written by the API. `PutItem` is granted only on `*-sets`, which holds client-submitted DOI lists — encrypted, with the key held by the client rather than the table.
+- **IAM:** the Lambda role has `GetItem` and `BatchGetItem` on the three data tables and nothing else — the FLoRA data itself can never be written by the API. `PutItem` is granted only on `*-sets`, which holds client-submitted DOI lists — encrypted in the browser, under a key the API never receives.
 
 Privacy is the reason for the prefix table. The Zotero client never sends the DOIs in
 your library; it hashes each one and sends only the first three characters of the hash.
@@ -45,14 +45,14 @@ the ones it actually asked about.
 
 Base URL is the API Gateway endpoint printed by `serverless deploy`.
 
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `GET`/`POST` | `/v1/prefix-lookup` | Hash prefixes → full DOI records |
-| `GET`/`POST` | `/v1/original-lookup` | DOIs → full DOI records |
-| `GET` | `/v1/dois` | Every DOI in the database (identifiers only) |
-| `GET`/`POST` | `/v1/search` | Fuzzy search over title, authors, and year |
-| `POST` | `/v1/sets` | Store a list of DOIs, get back a short id |
-| `GET` | `/v1/sets/{id}` | Read a stored list back (expires after 30 days; `id` carries the key) |
+| Method       | Path                  | Purpose                                                   |
+| ------------ | --------------------- | --------------------------------------------------------- |
+| `GET`/`POST` | `/v1/prefix-lookup`   | Hash prefixes → full DOI records                          |
+| `GET`/`POST` | `/v1/original-lookup` | DOIs → full DOI records                                   |
+| `GET`        | `/v1/dois`            | Every DOI in the database (identifiers only)              |
+| `GET`/`POST` | `/v1/search`          | Fuzzy search over title, authors, and year                |
+| `POST`       | `/v1/sets`            | Store a list of DOIs, get back a short id                 |
+| `GET`        | `/v1/sets/{id}`       | Read a stored encrypted list back (expires after 30 days) |
 
 Every endpoint accepts parameters either as a JSON body or as a query string, handles
 `OPTIONS` preflight, and returns `{ "error": ... }` with a 400 or 500 on failure.
@@ -106,16 +106,16 @@ curl -X POST "$API/v1/search" \
   -d '{"query": "social priming 2012", "limit": 50}'
 ```
 
-| Field | Type | Notes |
-| --- | --- | --- |
-| `query` (or `q`) | string | Free text; a bare 1800–2099 year in the string is extracted as a year filter |
-| `mustHave` | string[] | All terms must match (AND) |
-| `anyOf` | string[] | At least one term must match (OR) |
-| `exclude` | string[] | Terms that must be absent from all fields |
-| `yearFrom` / `yearTo` | number | Inclusive range; entries with an unparseable year are kept |
-| `paperTypes` | string[] | `original`, `replication`, `reproduction` |
-| `outcomes` | string[] | Keeps records whose replication outcomes all fall in the set |
-| `limit` / `offset` | number | `limit` clamped to 1–1000 (default 1000) |
+| Field                 | Type     | Notes                                                                        |
+| --------------------- | -------- | ---------------------------------------------------------------------------- |
+| `query` (or `q`)      | string   | Free text; a bare 1800–2099 year in the string is extracted as a year filter |
+| `mustHave`            | string[] | All terms must match (AND)                                                   |
+| `anyOf`               | string[] | At least one term must match (OR)                                            |
+| `exclude`             | string[] | Terms that must be absent from all fields                                    |
+| `yearFrom` / `yearTo` | number   | Inclusive range; entries with an unparseable year are kept                   |
+| `paperTypes`          | string[] | `original`, `replication`, `reproduction`                                    |
+| `outcomes`            | string[] | Keeps records whose replication outcomes all fall in the set                 |
+| `limit` / `offset`    | number   | `limit` clamped to 1–1000 (default 1000)                                     |
 
 `mustHave`, `anyOf`, and `exclude` support wildcards: `term*` (prefix), `*term` (suffix),
 `*term*` (contains), `?` (single character).
@@ -134,78 +134,76 @@ Stores a list of DOIs under a short id so a large selection can travel as `?set=
 instead of a query string long enough to trip the URI length limit. Sets are scratch
 space, not permalinks: the client re-`POST`s the list whenever it needs an id.
 
+The client encrypts the list before sending it, so the body is ciphertext only — see
+[Set encryption](#set-encryption):
+
 ```bash
-curl -X POST "$API/v1/sets" \
-  -H 'Content-Type: application/json' \
-  -d '{"dois": ["10.1037/xge0001132", "10.1016/j.jesp.2015.10.012"]}'
+curl -X POST "$API/v1/sets"   -H 'Content-Type: application/json'   -d '{"data": "k3Qh...", "iv": "2Fh1ZpQx7c9TbW0a"}'
 ```
 
 ```json
-{ "id": "ab12cd34.hT9v1RkQ0s_bXm4pE7ZLn2yWgC8jUdA6oIvF3rKqNxM", "count": 312,
-  "created": "2026-08-27T10:14:02Z", "expires": "2026-09-26T10:14:02Z" }
+{ "id": "ab12cd34", "expires": "2026-09-26T10:14:02Z" }
 ```
 
-The `id` is a share token in two parts: the row id, then the AES-256-GCM key that the list
-was encrypted with. Pass it back whole — see [Set encryption](#set-encryption). It is safe
-in a URL (unreserved characters only) and roughly 52 characters long.
-
-DOIs are normalised and deduplicated the same way `/v1/original-lookup` does them, so
-`count` can be lower than the number sent. Capped at 5000 DOIs per set. The body must be
-JSON with a non-empty `dois` array — no query-string form.
+`data` and `iv` are unpadded base64url. `iv` must decode to 12 bytes and `data` to between
+17 bytes and 256 KiB; anything else is a `400`. The API cannot see or check the DOIs inside,
+so normalising, deduplicating and capping the list is the client's job.
 
 ### `GET /v1/sets/{id}`
 
 ```json
-{ "id": "ab12cd34.hT9v...", "dois": ["10.1037/xge0001132", "..."], "count": 312, "created": "2026-08-27T10:14:02Z", "expires": "2026-09-26T10:14:02Z" }
+{
+  "id": "ab12cd34",
+  "data": "k3Qh...",
+  "iv": "2Fh1ZpQx7c9TbW0a",
+  "expires": "2026-09-26T10:14:02Z"
+}
 ```
 
-A set is immutable but not permanent, so the `immutable` cache header carries a `max-age`
-of whatever is left of its 30 days — never long enough to outlive the record. The cache is
-`private` rather than `public`: the URL carries the decryption key, so no shared proxy or
-CDN should be keeping a copy of the answer.
+Returns exactly the ciphertext that was stored; the client decrypts it. A set is immutable
+but not permanent, so the `immutable` cache header carries a `max-age` of whatever is left
+of its 30 days — never long enough to outlive the record.
 
 Unknown, malformed, and expired ids all answer `404` with the same body:
 
 ```json
-{ "error": "This link has expired. Please generate it again.", "code": "set_expired" }
+{
+  "error": "This link has expired. Please generate it again.",
+  "code": "set_expired"
+}
 ```
 
 They share one response because once DynamoDB has swept a row, an expired id and one that
-never existed are indistinguishable — and the client's move is the same either way. A token
-with the wrong or missing key answers the same way on purpose, so the endpoint cannot be
-used to tell a valid key from an invalid one.
+never existed are indistinguishable — and the client's move is the same either way.
 **Treat `404` as "re-`POST` the list", not as an error.** Branch on `code`, not on the
 `error` sentence, which is meant for humans and may be reworded.
 
 ### Set encryption
 
-Submitted DOI lists are user data, so a set is encrypted before it is stored and the
-server keeps no way to read it back on its own.
+Submitted DOI lists are user data, so they are encrypted in the browser and the API never
+holds a key that can read them.
 
-Each `POST /v1/sets` generates a fresh 256-bit key — nothing is reused between sets, so one
-leaked key exposes one list and no others. The DOIs, their count, and the creation time are
-sealed into a single AES-256-GCM payload under that key, and the row that lands in DynamoDB
-holds only the ciphertext, the IV, the auth tag, and the plaintext `ttl` that DynamoDB needs
-in order to sweep it:
+1. The client generates a fresh 256-bit key and a 12-byte IV, and encrypts
+   `{"dois": [...], "created": "<ISO time>"}` with AES-256-GCM (additional data
+   `flora-doi-set:v2`). WebCrypto appends the 16-byte auth tag to the ciphertext.
+2. It `POST`s `{data, iv}` and gets back an id.
+3. The share link puts the key in the URL **fragment**: `?set=<id>#k=<key>`, the key as 43
+   characters of unpadded base64url. Browsers never send the fragment to any server, so
+   neither this API nor the site hosting the link sees it.
+4. The page that opens the link reads `k` from the fragment, `GET`s the set by id, and
+   decrypts it locally. A wrong key or a row altered in storage fails GCM's tag check, so
+   the client never shows altered DOIs.
 
-```json
-{ "id": "ab12cd34", "data": "k3Qh...", "iv": "2Fh1...", "tag": "9aQ...", "ttl": 1788000842 }
-```
+What that buys:
 
-The key is never written anywhere. It leaves in the `POST` response as the second half of
-the token and comes back in the `GET` path, which is the only reason the server can decrypt
-at all. A dump of the table — a backup, a misconfigured IAM policy, a snapshot handed to
-someone — decrypts to nothing. GCM also authenticates: a row edited in place fails its tag
-check and answers `404` rather than returning altered DOIs.
-
-Two consequences worth designing around:
-
-- **Losing the token loses the set.** There is no recovery path and no support override.
-  That is the point, and it is cheap here because a client can always re-`POST` the list.
-- **The key is in the URL path**, so it reaches anywhere that URL reaches: API Gateway
-  access logs if you enable them, browser history, a `Referer` header on outbound links.
-  Keep set URLs out of logs you retain, and prefer `fetch` over navigation when the client
-  can.
+- **The API never sees the DOIs or the key** — not when a set is created, not when it is
+  opened. A dump of the table, the Lambda's logs, or a compromised Lambda yields only
+  ciphertext.
+- **One key per set**, so one leaked link exposes one list.
+- **Losing the link loses the set.** There is no recovery path and no support override.
+  That is cheap here because a client can always re-`POST` the list.
+- **The full link is a bearer secret.** Anyone holding it can read the list until it
+  expires; the id alone reads nothing.
 
 ## Data model
 
@@ -217,7 +215,7 @@ Four tables, all `PAY_PER_REQUEST`, named `zotero-replication-backend-<stage>-<s
 { "prefix": "198", "dois": ["10.1037/a0012833", "..."] }
 ```
 
-**`*-doi`** — key `doi` (S). `record` is a JSON *string*, not a nested map.
+**`*-doi`** — key `doi` (S). `record` is a JSON _string_, not a nested map.
 
 ```json
 {
@@ -233,7 +231,7 @@ ETL (`outcome_mix`, `replication_year_counts`, `first_replication_year`,
 `first_replication_outcome`) and by the OpenCitations pipeline (`citation_timeline`,
 `n_citations`).
 
-Those derived fields are stored *inside* `record` but returned at the **top level** of the
+Those derived fields are stored _inside_ `record` but returned at the **top level** of the
 API response, and [src/recordFields.ts](src/recordFields.ts) strips the nested copies on
 the way out so each key ships exactly once. Everything else in `record` — `originals`,
 `replications`, `reproductions`, `stats` — is passed through untouched. The handlers also
@@ -252,12 +250,11 @@ every chunk on a cold start and caches the assembled index — and the built Fus
 in memory for one hour.
 
 **`*-sets`** — key `id` (S). The only table the API writes to, and the only one the ETL
-does not touch. The DOIs, their count, and the creation time live inside `data` as one
-AES-256-GCM ciphertext; see [Set encryption](#set-encryption) for where the key goes.
+does not touch. `data` (B) is the client's AES-256-GCM ciphertext with its tag appended,
+and `iv` (B) its IV; the key is never sent to the API. See [Set encryption](#set-encryption).
 
 ```json
-{ "id": "ab12cd34", "data": "k3Qh...", "iv": "2Fh1...", "tag": "9aQ...",
-  "ttl": 1790503242 }
+{ "id": "ab12cd34", "data": <bytes>, "iv": <12 bytes>, "ttl": 1790503242 }
 ```
 
 Ids are 8 random hex characters, written with `attribute_not_exists(id)` so a collision
@@ -281,8 +278,7 @@ Invoke a function locally against your deployed tables:
 npm run invoke:prefix     # prefixLookup with {"prefixes":["a1b"]}
 npm run invoke:original   # originalLookup with {"dois":["10.1234/abc"]}
 npm run invoke:search     # fuzzySearch with {"query":"social priming"}
-npm run invoke:sets       # setsCreate with {"dois":["10.1234/abc"]}
-                          # prints an id like "ab12cd34.<key>" — pass it back whole to setsGet
+npm run invoke:sets       # setsCreate with a dummy {data, iv} — prints a bare id like "ab12cd34"
 ```
 
 Local invocation needs `PREFIX_TABLE`, `DOI_TABLE`, `SEARCH_TABLE`, and `SETS_TABLE` in the
@@ -322,13 +318,13 @@ The CSV must have `doi_o`, `doi_o_hash`, and `type` columns; `doi_r` and `doi_r_
 used when present. Rows with an original but no replication DOI are still recorded, and
 deduplicated on a fingerprint of their title, year, journal, references, and outcome.
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `PREFIX_TABLE`, `DOI_TABLE`, `SEARCH_TABLE` | — | Required; the script exits if any is unset |
-| `AWS_REGION` | `eu-central-1` | |
-| `PREFIX_LEN` | `3` | Characters of the DOI hash used as the prefix key |
-| `SEARCH_CHUNK_SIZE` | `500` | Entries per search-index chunk |
-| `CLEAR_TABLES` | `1` | **Wipes all three tables before writing.** Set to `0` to append |
+| Variable                                    | Default        | Meaning                                                         |
+| ------------------------------------------- | -------------- | --------------------------------------------------------------- |
+| `PREFIX_TABLE`, `DOI_TABLE`, `SEARCH_TABLE` | —              | Required; the script exits if any is unset                      |
+| `AWS_REGION`                                | `eu-central-1` |                                                                 |
+| `PREFIX_LEN`                                | `3`            | Characters of the DOI hash used as the prefix key               |
+| `SEARCH_CHUNK_SIZE`                         | `500`          | Entries per search-index chunk                                  |
+| `CLEAR_TABLES`                              | `1`            | **Wipes all three tables before writing.** Set to `0` to append |
 
 `CLEAR_TABLES` defaults to on, so a plain run is a full rebuild, not an incremental
 update. Set it to `0` if that is not what you want.
@@ -344,7 +340,6 @@ src/
   sets.ts       setsCreate     — POST     /v1/sets
                 setsGet        — GET      /v1/sets/{id}
   doi.ts        DOI normalisation shared by the lookup endpoints
-  crypto.ts     AES-256-GCM seal/open and key encoding, used by sets.ts
 etl/
   seed_prefixes.py             FLoRA CSV → DynamoDB
 serverless.yml                 Functions, routes, IAM, table definitions
@@ -369,9 +364,8 @@ tsconfig.json
   trusting the table. DynamoDB deletes expired items lazily — up to ~48h late — so a swept-late
   row would otherwise stay readable past its date. The handler 404s the moment `ttl` passes;
   the sweeper only reclaims the storage.
-- **A set id without its key is useless,** including to the server. Truncating the token,
-  logging only the first half, or storing the id in a database without the key all lose the
-  set permanently. Treat the whole string as one opaque value.
+- **A set id without its key is useless,** including to the server, which never has the key.
+  Clients must keep the `#k=` fragment with the id; dropping it loses the set permanently.
 - No test suite yet: `npm test` is a stub.
 
 ## License
