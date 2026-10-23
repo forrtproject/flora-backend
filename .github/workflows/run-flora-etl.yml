@@ -36,7 +36,7 @@ on:
           - "no"
 
       source_ref:
-        description: "flora-validation branch, tag or commit to load output/flora.csv from"
+        description: "flora-validation branch, tag or full 40-character commit SHA to load output/flora.csv from"
         required: true
         default: "main"
         type: string
@@ -44,22 +44,24 @@ on:
 permissions:
   contents: read
 
-# Never let two loads write the same tables at the same time.
-concurrency:
-  group: flora-etl-${{ inputs.target_tables || 'original' }}
-  cancel-in-progress: false
-
 jobs:
   run-etl:
     if: github.event_name != 'schedule' || vars.FLORA_ETL_SCHEDULE == 'on'
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
+    # Never let two loads write the same tables at the same time. On the job,
+    # not the workflow, so a skipped scheduled run never joins the group and
+    # cancels a manual run waiting in it.
+    concurrency:
+      group: flora-etl-${{ inputs.target_tables || 'original' }}
+      cancel-in-progress: false
+
+    # The AWS keys are not set here: only the two steps that need them get
+    # them, so checkout, setup-python and pip never see them.
     env:
       # Scheduled runs have no inputs, so they fall back to the defaults below.
       AWS_REGION: ${{ secrets.AWS_REGION || 'eu-central-1' }}
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
 
       TARGET_TABLES: ${{ inputs.target_tables || 'original' }}
       CLEAR_TABLES_INPUT: ${{ inputs.clear_tables || 'default' }}
@@ -81,6 +83,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       # Only output/, so flora.csv and its manifest come from the same commit.
       - name: Check out flora-validation output
@@ -167,7 +171,11 @@ jobs:
           fi
 
       - name: Preflight
+        id: preflight
         shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         run: |
           set -euo pipefail
 
@@ -207,6 +215,7 @@ jobs:
       # Fails on a dataset that does not match its manifest, lacks the columns
       # the ETL needs, or is implausibly small. Warns on known data problems.
       - name: Check dataset against its manifest
+        id: check
         shell: bash
         run: |
           set -euo pipefail
@@ -215,6 +224,7 @@ jobs:
           import hashlib
           import json
           import os
+          import re
           import sys
 
           import pandas as pd
@@ -222,8 +232,15 @@ jobs:
           csv_path = os.environ["CSV_FILE"]
           min_rows = int(os.environ["MIN_ROWS"])
 
-          with open(os.environ["MANIFEST_FILE"], encoding="utf-8") as f:
-              manifest = json.load(f)
+          try:
+              with open(os.environ["MANIFEST_FILE"], encoding="utf-8-sig") as f:
+                  manifest = json.load(f)
+          except ValueError as e:
+              print(f"::error::The manifest is not valid JSON: {e}")
+              sys.exit(1)
+          if not isinstance(manifest, dict):
+              print("::error::The manifest is not a JSON object.")
+              sys.exit(1)
 
           with open(csv_path, "rb") as f:
               sha256 = hashlib.sha256(f.read()).hexdigest()
@@ -233,10 +250,18 @@ jobs:
           rows = len(df)
           errors = []
 
-          if sha256 != manifest.get("sha256"):
-              errors.append(f"sha256 {sha256} does not match the manifest's {manifest.get('sha256')}")
-          if rows != manifest.get("rows"):
-              errors.append(f"{rows} rows read, the manifest says {manifest.get('rows')}")
+          # Manifest values come from another repository. They are compared and
+          # shown with repr(), never exported or printed raw: a newline in a
+          # $GITHUB_ENV line would let them set any variable for later steps.
+          expected_sha256 = str(manifest.get("sha256") or "").strip().lower()
+          if sha256 != expected_sha256:
+              errors.append(f"sha256 {sha256} does not match the manifest's {expected_sha256!r}")
+          try:
+              expected_rows = int(manifest.get("rows"))
+          except (TypeError, ValueError):
+              expected_rows = None
+          if rows != expected_rows:
+              errors.append(f"{rows} rows read, the manifest says {manifest.get('rows')!r}")
           missing = sorted({"doi_o", "doi_o_hash", "type"} - set(df.columns))
           if missing:
               errors.append(f"missing required columns: {missing}")
@@ -252,14 +277,19 @@ jobs:
                   if n:
                       print(f"::warning::{n} rows have JSON in {col} instead of a reference")
 
-          print(f"Generated: {manifest.get('generated_at')}")
+          # Only a plain ISO timestamp is passed on.
+          generated_at = str(manifest.get("generated_at") or "")
+          if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+(Z|[+-][0-9]{2}:[0-9]{2})?", generated_at):
+              generated_at = "unknown"
+
+          print(f"Generated: {generated_at}")
           print(f"Rows:      {rows}")
           print(f"SHA-256:   {sha256}")
 
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
               f.write(f"DATASET_ROWS={rows}\n")
               f.write(f"DATASET_SHA256={sha256}\n")
-              f.write(f"DATASET_GENERATED_AT={manifest.get('generated_at')}\n")
+              f.write(f"DATASET_GENERATED_AT={generated_at}\n")
 
           for e in errors:
               print(f"::error::{e}")
@@ -267,7 +297,13 @@ jobs:
           PY
 
       - name: Run FLoRA ETL
+        id: etl
         shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          # Print each line as it happens, not when the script exits.
+          PYTHONUNBUFFERED: "1"
         run: |
           set -euo pipefail
 
@@ -276,10 +312,36 @@ jobs:
       - name: Write job summary
         if: always()
         shell: bash
+        env:
+          JOB_STATUS: ${{ job.status }}
+          PREFLIGHT_OUTCOME: ${{ steps.preflight.outcome }}
+          CHECK_OUTCOME: ${{ steps.check.outcome }}
+          ETL_OUTCOME: ${{ steps.etl.outcome }}
         run: |
+          # Only the ETL step writes to DynamoDB.
+          case "$ETL_OUTCOME" in
+            success)
+              result="Loaded." ;;
+            failure)
+              result="**The ETL failed.** The tables may be partly written: fix the cause and run the workflow again." ;;
+            cancelled)
+              result="**Cancelled during the load.** The tables may be partly written: run the workflow again." ;;
+            *)
+              if [ "$JOB_STATUS" = "cancelled" ]; then
+                result="**Cancelled before loading.** Nothing was written to DynamoDB."
+              elif [ "$PREFLIGHT_OUTCOME" = "failure" ]; then
+                result="**Stopped before loading:** a secret or file is missing. Nothing was written to DynamoDB."
+              elif [ "$CHECK_OUTCOME" = "failure" ]; then
+                result="**Stopped before loading:** the dataset failed its checks. Nothing was written to DynamoDB."
+              else
+                result="**Stopped before loading.** Nothing was written to DynamoDB."
+              fi ;;
+          esac
+
           {
             echo "### FLoRA ETL"
             echo ""
+            echo "- Result: $result"
             echo "- Tables: \`$TARGET_TABLES\`"
             echo "- Source: \`$SOURCE_REPO@${SOURCE_SHA:-unknown}\` (\`$SOURCE_REF\`)"
             echo "- Dataset: ${DATASET_ROWS:-?} rows, generated ${DATASET_GENERATED_AT:-?}, sha256 \`${DATASET_SHA256:-?}\`"
