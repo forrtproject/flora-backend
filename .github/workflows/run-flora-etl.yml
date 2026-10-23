@@ -1,0 +1,292 @@
+name: Run FLoRA ETL
+
+# Loads flora-validation's published FLoRA dataset (output/flora.csv) into the
+# DynamoDB tables the API reads, with this repository's etl/seed_prefixes.py.
+# Modelled on fred-data's "Run FReD ETL"; the secrets use the same names.
+
+on:
+  # 05:30 UTC daily. flora-validation's nightly release has landed between
+  # 03:22 and 04:45 UTC. GitHub Actions cron is always UTC.
+  #
+  # Scheduled runs load the ORIGINAL tables, and stay skipped until the
+  # repository variable FLORA_ETL_SCHEDULE is "on" - so the workflow can be
+  # merged and tested by hand before it writes production every night.
+  schedule:
+    - cron: "30 5 * * *"
+
+  workflow_dispatch:
+    inputs:
+      target_tables:
+        description: "Which database to load data into"
+        required: true
+        default: "test"
+        type: choice
+        options:
+          - test
+          - original
+
+      clear_tables:
+        description: "Delete all items before loading (default = clear test, keep original)"
+        required: true
+        default: "default"
+        type: choice
+        options:
+          - default
+          - "yes"
+          - "no"
+
+      source_ref:
+        description: "flora-validation branch, tag or commit to load output/flora.csv from"
+        required: true
+        default: "main"
+        type: string
+
+permissions:
+  contents: read
+
+# Never let two loads write the same tables at the same time.
+concurrency:
+  group: flora-etl-${{ inputs.target_tables || 'original' }}
+  cancel-in-progress: false
+
+jobs:
+  run-etl:
+    if: github.event_name != 'schedule' || vars.FLORA_ETL_SCHEDULE == 'on'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      # Scheduled runs have no inputs, so they fall back to the defaults below.
+      AWS_REGION: ${{ secrets.AWS_REGION || 'eu-central-1' }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      TARGET_TABLES: ${{ inputs.target_tables || 'original' }}
+      CLEAR_TABLES_INPUT: ${{ inputs.clear_tables || 'default' }}
+
+      SOURCE_REPO: forrtproject/flora-validation
+      SOURCE_REF: ${{ inputs.source_ref || 'main' }}
+      CSV_FILE: flora-validation/output/flora.csv
+      MANIFEST_FILE: flora-validation/output/flora_release_manifest.json
+
+      ETL_SCRIPT: etl/seed_prefixes.py
+
+      # Refuse to load a dataset smaller than this (3,080 rows on 2026-10-21).
+      MIN_ROWS: "2500"
+
+      # Settings read by the ETL script
+      PREFIX_LEN: "3"
+      SEARCH_CHUNK_SIZE: "500"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      # Only output/, so flora.csv and its manifest come from the same commit.
+      - name: Check out flora-validation output
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_REF }}
+          path: flora-validation
+          sparse-checkout: output
+          persist-credentials: false
+
+      - name: Record source commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "SOURCE_SHA=$(git -C flora-validation rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+
+      - name: Install ETL dependencies
+        run: |
+          python -m pip install --upgrade pip
+
+          # Pinned to the versions the ETL was last checked against.
+          pip install pandas==3.0.6 boto3==1.43.114 ftfy==6.3.1
+
+      - name: Select target tables
+        shell: bash
+        env:
+          PROD_PREFIX_TABLE: ${{ secrets.PROD_PREFIX_TABLE }}
+          PROD_DOI_TABLE: ${{ secrets.PROD_DOI_TABLE }}
+          PROD_SEARCH_TABLE: ${{ secrets.PROD_SEARCH_TABLE }}
+          TEST_PREFIX_TABLE: ${{ secrets.TEST_PREFIX_TABLE }}
+          TEST_DOI_TABLE: ${{ secrets.TEST_DOI_TABLE }}
+          TEST_SEARCH_TABLE: ${{ secrets.TEST_SEARCH_TABLE }}
+        run: |
+          set -euo pipefail
+
+          # Scheduled runs always use the ORIGINAL tables.
+          # Manual runs use the option selected in GitHub Actions.
+
+          if [ "$TARGET_TABLES" = "original" ]; then
+
+            echo "Using ORIGINAL tables"
+
+            echo "PREFIX_TABLE=$PROD_PREFIX_TABLE" >> "$GITHUB_ENV"
+            echo "DOI_TABLE=$PROD_DOI_TABLE" >> "$GITHUB_ENV"
+            echo "SEARCH_TABLE=$PROD_SEARCH_TABLE" >> "$GITHUB_ENV"
+
+            # Do not delete the production tables before loading
+            clear_tables="0"
+
+          else
+
+            echo "Using TEST tables"
+
+            echo "PREFIX_TABLE=$TEST_PREFIX_TABLE" >> "$GITHUB_ENV"
+            echo "DOI_TABLE=$TEST_DOI_TABLE" >> "$GITHUB_ENV"
+            echo "SEARCH_TABLE=$TEST_SEARCH_TABLE" >> "$GITHUB_ENV"
+
+            # Clear test tables before loading
+            clear_tables="1"
+
+          fi
+
+          # A manual run can override the default clearing behaviour.
+          case "$CLEAR_TABLES_INPUT" in
+            yes) clear_tables="1" ;;
+            no)  clear_tables="0" ;;
+          esac
+
+          echo "CLEAR_TABLES=$clear_tables" >> "$GITHUB_ENV"
+          echo "CLEAR_TABLES: $clear_tables"
+
+          if [ "$TARGET_TABLES" = "original" ] && [ "$clear_tables" = "0" ]; then
+            msg="Loading the original tables without clearing them."
+            msg="$msg DOIs removed from the CSV stay in the DOI table, and search chunks"
+            msg="$msg beyond the new meta count stay in the search table."
+            msg="$msg Run manually with clear_tables=yes for a full rebuild."
+            echo "::warning::$msg"
+          fi
+
+      - name: Preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Event type:    $GITHUB_EVENT_NAME"
+          echo "Target tables: $TARGET_TABLES"
+          echo "AWS region:    $AWS_REGION"
+          echo "CLEAR_TABLES:  $CLEAR_TABLES"
+          echo "PREFIX_TABLE:  $PREFIX_TABLE"
+          echo "DOI_TABLE:     $DOI_TABLE"
+          echo "SEARCH_TABLE:  $SEARCH_TABLE"
+          echo "Source:        $SOURCE_REPO@$SOURCE_SHA ($SOURCE_REF)"
+
+          fail=0
+
+          for var in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY \
+                     PREFIX_TABLE DOI_TABLE SEARCH_TABLE; do
+            if [ -z "${!var:-}" ]; then
+              echo "::error::$var is empty. Check the repository secrets."
+              fail=1
+            fi
+          done
+
+          for file in "$CSV_FILE" "$MANIFEST_FILE" "$ETL_SCRIPT"; do
+            if [ ! -f "$file" ]; then
+              echo "::error::$file was not found."
+              fail=1
+            fi
+          done
+
+          if [ "$fail" -ne 0 ]; then
+            exit 1
+          fi
+
+          echo "Input CSV:"
+          ls -lh "$CSV_FILE"
+
+      # Fails on a dataset that does not match its manifest, lacks the columns
+      # the ETL needs, or is implausibly small. Warns on known data problems.
+      - name: Check dataset against its manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          import sys
+
+          import pandas as pd
+
+          csv_path = os.environ["CSV_FILE"]
+          min_rows = int(os.environ["MIN_ROWS"])
+
+          with open(os.environ["MANIFEST_FILE"], encoding="utf-8") as f:
+              manifest = json.load(f)
+
+          with open(csv_path, "rb") as f:
+              sha256 = hashlib.sha256(f.read()).hexdigest()
+
+          # Read the way the ETL reads it.
+          df = pd.read_csv(csv_path, encoding="utf-8", engine="python", on_bad_lines="warn", dtype=str)
+          rows = len(df)
+          errors = []
+
+          if sha256 != manifest.get("sha256"):
+              errors.append(f"sha256 {sha256} does not match the manifest's {manifest.get('sha256')}")
+          if rows != manifest.get("rows"):
+              errors.append(f"{rows} rows read, the manifest says {manifest.get('rows')}")
+          missing = sorted({"doi_o", "doi_o_hash", "type"} - set(df.columns))
+          if missing:
+              errors.append(f"missing required columns: {missing}")
+          if rows < min_rows:
+              errors.append(f"only {rows} rows, fewer than MIN_ROWS={min_rows}")
+
+          merged = int(df["outcome"].fillna("").str.contains("||", regex=False).sum()) if "outcome" in df else 0
+          if merged:
+              print(f"::warning::{merged} rows have a merged outcome (\"A || B\")")
+          for col in ("apa_ref_o", "apa_ref_r"):
+              if col in df:
+                  n = int(df[col].fillna("").str.strip().str.startswith("{").sum())
+                  if n:
+                      print(f"::warning::{n} rows have JSON in {col} instead of a reference")
+
+          print(f"Generated: {manifest.get('generated_at')}")
+          print(f"Rows:      {rows}")
+          print(f"SHA-256:   {sha256}")
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+              f.write(f"DATASET_ROWS={rows}\n")
+              f.write(f"DATASET_SHA256={sha256}\n")
+              f.write(f"DATASET_GENERATED_AT={manifest.get('generated_at')}\n")
+
+          for e in errors:
+              print(f"::error::{e}")
+          sys.exit(1 if errors else 0)
+          PY
+
+      - name: Run FLoRA ETL
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python "$ETL_SCRIPT" "$CSV_FILE" | tee etl.log
+
+      - name: Write job summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### FLoRA ETL"
+            echo ""
+            echo "- Tables: \`$TARGET_TABLES\`"
+            echo "- Source: \`$SOURCE_REPO@${SOURCE_SHA:-unknown}\` (\`$SOURCE_REF\`)"
+            echo "- Dataset: ${DATASET_ROWS:-?} rows, generated ${DATASET_GENERATED_AT:-?}, sha256 \`${DATASET_SHA256:-?}\`"
+            echo "- CLEAR_TABLES: \`${CLEAR_TABLES:-unset}\`"
+            if [ -f etl.log ]; then
+              grep -E '^(Prepared|Wrote|Cleared)' etl.log | sed 's/^/- /' || true
+            else
+              echo "- No ETL output (the run failed before the load started)."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
