@@ -41,6 +41,17 @@ on:
         default: "main"
         type: string
 
+      prune:
+        description: "After a load without clearing, delete items no longer in the CSV (force = even above the 25% limit)"
+        required: true
+        default: "yes"
+        type: choice
+        options:
+          - "yes"
+          - dry-run
+          - force
+          - "no"
+
 permissions:
   contents: read
 
@@ -79,6 +90,13 @@ jobs:
       # Settings read by the ETL script
       PREFIX_LEN: "3"
       SEARCH_CHUNK_SIZE: "500"
+
+      # Scheduled runs prune. The first prune deletes about 12% of the DOI
+      # table (about 680 DOIs left over since the fred-data loads, estimated
+      # 2026-11-28); a nightly one deletes a handful. More than this share
+      # stops the prune and fails the run.
+      PRUNE: ${{ inputs.prune || 'yes' }}
+      PRUNE_MAX_FRACTION: "0.25"
 
     steps:
       - name: Check out repository
@@ -162,11 +180,10 @@ jobs:
           echo "CLEAR_TABLES=$clear_tables" >> "$GITHUB_ENV"
           echo "CLEAR_TABLES: $clear_tables"
 
-          if [ "$TARGET_TABLES" = "original" ] && [ "$clear_tables" = "0" ]; then
-            msg="Loading the original tables without clearing them."
-            msg="$msg DOIs removed from the CSV stay in the DOI table, and search chunks"
-            msg="$msg beyond the new meta count stay in the search table."
-            msg="$msg Run manually with clear_tables=yes for a full rebuild."
+          if [ "$TARGET_TABLES" = "original" ] && [ "$clear_tables" = "0" ] \
+             && { [ "$PRUNE" = "no" ] || [ "$PRUNE" = "dry-run" ]; }; then
+            msg="Loading the original tables without clearing or pruning them (prune=$PRUNE)."
+            msg="$msg DOIs removed from the CSV stay in the DOI table until a run with prune=yes."
             echo "::warning::$msg"
           fi
 
@@ -183,6 +200,7 @@ jobs:
           echo "Target tables: $TARGET_TABLES"
           echo "AWS region:    $AWS_REGION"
           echo "CLEAR_TABLES:  $CLEAR_TABLES"
+          echo "PRUNE:         $PRUNE (limit $PRUNE_MAX_FRACTION)"
           echo "PREFIX_TABLE:  $PREFIX_TABLE"
           echo "DOI_TABLE:     $DOI_TABLE"
           echo "SEARCH_TABLE:  $SEARCH_TABLE"
@@ -323,7 +341,13 @@ jobs:
             success)
               result="Loaded." ;;
             failure)
-              result="**The ETL failed.** The tables may be partly written: fix the cause and run the workflow again." ;;
+              if [ -f etl.log ] && grep -q '^Prune refused' etl.log; then
+                result="**Loaded, but nothing was pruned:** more than PRUNE_MAX_FRACTION of the DOI table would have been deleted. Check the stale DOIs in the run log; if they are right, run manually with prune=force."
+              elif [ -f etl.log ] && grep -q '^Prune failed' etl.log; then
+                result="**Loaded, but the prune failed:** the new data is in place and some stale items may remain. The next run prunes again; see the run log for the error."
+              else
+                result="**The ETL failed.** The tables may be partly written: fix the cause and run the workflow again."
+              fi ;;
             cancelled)
               result="**Cancelled during the load.** The tables may be partly written: run the workflow again." ;;
             *)
@@ -345,9 +369,10 @@ jobs:
             echo "- Tables: \`$TARGET_TABLES\`"
             echo "- Source: \`$SOURCE_REPO@${SOURCE_SHA:-unknown}\` (\`$SOURCE_REF\`)"
             echo "- Dataset: ${DATASET_ROWS:-?} rows, generated ${DATASET_GENERATED_AT:-?}, sha256 \`${DATASET_SHA256:-?}\`"
-            echo "- CLEAR_TABLES: \`${CLEAR_TABLES:-unset}\`"
+            if [ "${CLEAR_TABLES:-}" = "1" ]; then prune_shown="n/a (cleared)"; else prune_shown="${PRUNE:-unset}"; fi
+            echo "- CLEAR_TABLES: \`${CLEAR_TABLES:-unset}\`, PRUNE: \`$prune_shown\`"
             if [ -f etl.log ]; then
-              grep -E '^(Prepared|Wrote|Cleared)' etl.log | sed 's/^/- /' || true
+              grep -E '^(Prepared|Wrote|Cleared|Kept|Stale|Prune|PRUNE)' etl.log | sed 's/^/- /' || true
             else
               echo "- No ETL output (the run failed before the load started)."
             fi

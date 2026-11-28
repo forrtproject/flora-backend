@@ -25,6 +25,22 @@ Key behavior:
    - "reproduction"
    A DOI may have one, two, or all three roles.
 
+6) Keeps what the Atlas pipeline (flora-replication-atlas,
+   scripts/refresh_data.py) writes to DOI_TABLE:
+   - each DOI's top-level citation_timeline / n_citations, read from the
+     table before the load and merged into the new record
+   - its meta#... and aggregate#... items: never written, and put back
+     unchanged after CLEAR_TABLES empties the table
+   If that read fails, the script stops before writing anything.
+
+7) Prunes what an earlier load left behind (only when CLEAR_TABLES is off):
+   after everything is written, deletes the DOI items, prefixes and search
+   chunks this CSV no longer has, so a record that leaves FLoRA also leaves
+   the API. Never deletes the Atlas pipeline's meta#/aggregate# items. If more
+   than PRUNE_MAX_FRACTION of the DOI table would go, deletes nothing and
+   exits 5; if the prune itself fails, exits 6. Either way the new data is
+   already written.
+
 Tables written:
   1) PREFIX_TABLE: prefix (3-char) -> dois (List[str])
   2) DOI_TABLE: doi (str) -> record (JSON string)
@@ -38,6 +54,9 @@ Env:
   PREFIX_LEN         default 3
   SEARCH_CHUNK_SIZE  default 1000
   CLEAR_TABLES       default "1"
+  PRUNE              default "yes"; "dry-run" lists what would go, "force"
+                     skips the PRUNE_MAX_FRACTION check, "no" keeps everything
+  PRUNE_MAX_FRACTION default 0.25
 
 Usage:
   python etl/build_two_tables_doi_records.py <csv_file>
@@ -49,6 +68,7 @@ import json
 import html
 import hashlib
 from collections import defaultdict
+from decimal import Decimal
 
 import boto3
 import pandas as pd
@@ -64,11 +84,39 @@ CLEAR_TABLES = os.getenv("CLEAR_TABLES", "1").strip() not in (
 )
 SEARCH_CHUNK = int(os.getenv("SEARCH_CHUNK_SIZE", "500"))
 
+_PRUNE_MODES = {
+    "yes": "yes", "1": "yes", "true": "yes",
+    "no": "no", "0": "no", "false": "no",
+    "dry-run": "dry-run",
+    "force": "force",
+}
+PRUNE = _PRUNE_MODES.get(os.getenv("PRUNE", "yes").strip().lower())
+try:
+    PRUNE_MAX_FRACTION = float(os.getenv("PRUNE_MAX_FRACTION", "0.25"))
+except ValueError:
+    PRUNE_MAX_FRACTION = float("nan")
+
+# Keys of the Atlas pipeline's own items in DOI_TABLE. No DOI starts with these.
+ATLAS_ITEM_PREFIXES = ("meta#", "aggregate#")
+
+# Top-level keys the Atlas pipeline sets in a DOI's record blob. The nested
+# record.record.citation_timeline is an older ETL's replications-per-year map
+# under the same name, and is never carried over.
+CITATION_KEYS = ("citation_timeline", "n_citations")
+
 if not PREFIX_TABLE or not DOI_TABLE or not SEARCH_TABLE:
     print(
         "ERROR: set PREFIX_TABLE, DOI_TABLE, and SEARCH_TABLE env vars",
         file=sys.stderr,
     )
+    sys.exit(1)
+
+if PRUNE is None:
+    print("ERROR: PRUNE must be yes, no, dry-run or force", file=sys.stderr)
+    sys.exit(1)
+
+if not 0 < PRUNE_MAX_FRACTION <= 1:
+    print("ERROR: PRUNE_MAX_FRACTION must be a number above 0 and at most 1", file=sys.stderr)
     sys.exit(1)
 
 
@@ -406,6 +454,144 @@ def clear_table(table_name: str):
     print(f"Cleared {deleted} items from {table_name}")
 
 
+def from_ddb(v):
+    """DynamoDB numbers come back as Decimal, which json.dumps rejects."""
+    if isinstance(v, Decimal):
+        return int(v) if v == v.to_integral_value() else float(v)
+    if isinstance(v, dict):
+        return {k: from_ddb(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [from_ddb(x) for x in v]
+    return v
+
+
+def read_atlas_data(tbl):
+    """
+    Scan DOI_TABLE for what the Atlas pipeline wrote, since put_item replaces
+    whole items. Returns ({doi: {citation key: value}}, [meta#/aggregate# keys],
+    number of unreadable records, {every other key in the table}). A failed
+    scan raises.
+    """
+    citations: dict[str, dict] = {}
+    atlas_keys: list[str] = []
+    doi_keys: set[str] = set()
+    n_bad = 0
+    kwargs = {
+        "ProjectionExpression": "#doi, #rec, #ct, #nc",
+        "ExpressionAttributeNames": {
+            "#doi": "doi",
+            "#rec": "record",
+            "#ct": "citation_timeline",
+            "#nc": "n_citations",
+        },
+    }
+
+    while True:
+        resp = tbl.scan(**kwargs)
+        for it in resp.get("Items", []):
+            doi = it["doi"]
+            if doi.startswith(ATLAS_ITEM_PREFIXES):
+                atlas_keys.append(doi)
+                continue
+            doi_keys.add(doi)
+
+            # Only the blob's top level: the API reads the citation fields there.
+            blob = {}
+            if it.get("record") is not None:
+                try:
+                    blob = json.loads(it["record"])
+                except (TypeError, ValueError):
+                    blob = None
+                if not isinstance(blob, dict):
+                    n_bad += 1
+                    blob = {}
+
+            # Also accepted as top-level item attributes, which this script
+            # moves into the blob.
+            kept = {}
+            for key in CITATION_KEYS:
+                if blob.get(key) is not None:
+                    kept[key] = blob[key]
+                elif it.get(key) is not None:
+                    kept[key] = from_ddb(it[key])
+            if kept:
+                citations[doi] = kept
+
+        start_key = resp.get("LastEvaluatedKey")
+        if not start_key:
+            break
+        kwargs["ExclusiveStartKey"] = start_key
+
+    return citations, atlas_keys, n_bad, doi_keys
+
+
+def scan_keys(tbl, key: str) -> set[str]:
+    """Every key in a table. A failed scan raises."""
+    keys: set[str] = set()
+    kwargs = {"ProjectionExpression": "#k", "ExpressionAttributeNames": {"#k": key}}
+    while True:
+        resp = tbl.scan(**kwargs)
+        keys.update(it[key] for it in resp.get("Items", []))
+        start_key = resp.get("LastEvaluatedKey")
+        if not start_key:
+            break
+        kwargs["ExclusiveStartKey"] = start_key
+    return keys
+
+
+def delete_keys(tbl, key: str, keys) -> None:
+    with tbl.batch_writer() as batch:
+        for k in sorted(keys):
+            batch.delete_item(Key={key: k})
+
+
+def prune_stale(prefix_tbl, doi_tbl, search_tbl, scanned_dois: set[str],
+                loaded_dois: set[str], loaded_prefixes: set[str], total_chunks: int) -> bool:
+    """
+    Delete what an earlier load left and this CSV no longer has. Runs after
+    every write, so a failure here never takes away a current record.
+    scanned_dois is the DOI table before the load, without the Atlas items.
+    Returns False if PRUNE_MAX_FRACTION stopped it; then nothing is deleted.
+    """
+    stale_dois = scanned_dois - loaded_dois
+    stale_prefixes = scan_keys(prefix_tbl, "prefix") - loaded_prefixes
+    # Chunks past the meta count are never read, but are left from a larger load.
+    stale_chunks = {
+        k for k in scan_keys(search_tbl, "chunk_id")
+        if k.isdigit() and int(k) >= total_chunks
+    }
+
+    share = len(stale_dois) / len(scanned_dois) if scanned_dois else 0.0
+    print(
+        f"Stale: {len(stale_dois)} of {len(scanned_dois)} DOI items ({share:.1%}), "
+        f"{len(stale_prefixes)} prefixes, {len(stale_chunks)} search chunks"
+    )
+    for doi in sorted(stale_dois):
+        print(f"  stale DOI: {doi}")
+
+    if PRUNE == "dry-run":
+        print("Prune dry run (PRUNE=dry-run): nothing was deleted")
+        return True
+
+    if PRUNE != "force" and share > PRUNE_MAX_FRACTION:
+        print(
+            f"Prune refused: {share:.1%} of the DOI table is more than "
+            f"PRUNE_MAX_FRACTION={PRUNE_MAX_FRACTION:.0%}, so nothing was deleted. "
+            f"Check the stale DOIs above; if they are right, run again with PRUNE=force."
+        )
+        print(f"::error::Prune refused: {len(stale_dois)} DOI items ({share:.1%}) would have been deleted")
+        return False
+
+    delete_keys(doi_tbl, "doi", stale_dois)
+    delete_keys(prefix_tbl, "prefix", stale_prefixes)
+    delete_keys(search_tbl, "chunk_id", stale_chunks)
+    print(
+        f"Pruned {len(stale_dois)} DOI items, {len(stale_prefixes)} prefixes and "
+        f"{len(stale_chunks)} search chunks no longer in the CSV"
+    )
+    return True
+
+
 # -----------------------------
 # Main
 # -----------------------------
@@ -594,6 +780,17 @@ def main():
         roles = doi_types.get(doi, set())
         record["types"] = [t for t in type_order if t in roles]
 
+    # Never overwrite the Atlas pipeline's meta/aggregate items, even from a
+    # malformed CSV value that normalizes to one of their keys.
+    reserved = [d for d in doi_records if d.startswith(ATLAS_ITEM_PREFIXES)]
+    if reserved:
+        for d in reserved:
+            del doi_records[d]
+        for dois in prefix_index.values():
+            dois.difference_update(reserved)
+        prefix_index = {p: dois for p, dois in prefix_index.items() if dois}
+        print(f"WARNING: skipped {len(reserved)} DOIs with an Atlas item key: {reserved[:5]}", file=sys.stderr)
+
     print(f"Prepared {len(prefix_index)} prefixes and {len(doi_records)} doi records")
 
     ddb = boto3.resource("dynamodb", region_name=AWS_REGION)
@@ -601,9 +798,48 @@ def main():
     doi_tbl = ddb.Table(DOI_TABLE)
     search_tbl = ddb.Table(SEARCH_TABLE)
 
+    # Read the Atlas pipeline's data before anything is cleared or written. If
+    # that fails, stop: loading without it would wipe the citation data.
+    atlas_items = []
+    try:
+        kept_citations, atlas_keys, n_bad, scanned_dois = read_atlas_data(doi_tbl)
+        if CLEAR_TABLES:
+            for key in atlas_keys:
+                item = doi_tbl.get_item(Key={"doi": key}, ConsistentRead=True).get("Item")
+                if item:
+                    atlas_items.append(item)
+    except Exception as e:
+        print(f"ERROR reading {DOI_TABLE} before the load; nothing was written: {e!r}", file=sys.stderr)
+        sys.exit(4)
+
+    if n_bad:
+        print(f"WARNING: {n_bad} items in {DOI_TABLE} have an unreadable record; their citation data was not kept", file=sys.stderr)
+
+    n_kept = 0
+    for doi, fields in kept_citations.items():
+        record = doi_records.get(doi)
+        if record is None:
+            continue
+        for key, val in fields.items():
+            record.setdefault(key, val)
+        n_kept += 1
+    print(f"Kept citation data for {n_kept} DOIs ({len(kept_citations) - n_kept} no longer in the CSV)")
+
     if CLEAR_TABLES:
         clear_table(PREFIX_TABLE)
-        clear_table(DOI_TABLE)
+        try:
+            clear_table(DOI_TABLE)
+        finally:
+            # Runs even if the clear died half way, so the Atlas items are not
+            # lost. If this put fails too, the items are printed for recovery.
+            try:
+                with doi_tbl.batch_writer(overwrite_by_pkeys=["doi"]) as batch:
+                    for item in atlas_items:
+                        batch.put_item(Item=item)
+            except Exception:
+                print(f"ERROR restoring Atlas items; recover from: {json.dumps(atlas_items, default=str)}", file=sys.stderr)
+                raise
+        print(f"Kept {len(atlas_items)} meta/aggregate items in {DOI_TABLE} (put back after clearing)")
         clear_table(SEARCH_TABLE)
     else:
         print("CLEAR_TABLES=0 → not clearing tables")
@@ -693,6 +929,24 @@ def main():
             )
 
     print(f"Wrote {total_chunks} search index chunks ({len(search_entries)} entries)")
+
+    # A full rebuild emptied the tables, so only an in-place load leaves anything.
+    if not CLEAR_TABLES:
+        if PRUNE == "no":
+            print("PRUNE=no → items no longer in the CSV stay in the tables")
+        else:
+            try:
+                pruned = prune_stale(prefix_tbl, doi_tbl, search_tbl, scanned_dois,
+                                     set(doi_records), set(prefix_index), total_chunks)
+            except Exception as e:
+                print(
+                    f"Prune failed: {e!r}. The load is complete; some stale items may "
+                    f"remain, and the next run prunes again."
+                )
+                sys.exit(6)
+            if not pruned:
+                sys.exit(5)
+
     print("Done.")
 
 

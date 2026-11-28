@@ -231,6 +231,11 @@ ETL (`outcome_mix`, `replication_year_counts`, `first_replication_year`,
 `first_replication_outcome`) and by the OpenCitations pipeline (`citation_timeline`,
 `n_citations`).
 
+That pipeline (`scripts/refresh_data.py` in flora-replication-atlas) writes to this table
+too, so each ETL load reads its `citation_timeline` and `n_citations` first and carries
+them into the new records; a full rebuild (`CLEAR_TABLES=1`) also puts its `meta#…` and
+`aggregate#…` items back after clearing the table.
+
 Those derived fields are stored _inside_ `record` but returned at the **top level** of the
 API response, and [src/recordFields.ts](src/recordFields.ts) strips the nested copies on
 the way out so each key ships exactly once. Everything else in `record` — `originals`,
@@ -324,10 +329,24 @@ deduplicated on a fingerprint of their title, year, journal, references, and out
 | `AWS_REGION`                                | `eu-central-1` |                                                                 |
 | `PREFIX_LEN`                                | `3`            | Characters of the DOI hash used as the prefix key               |
 | `SEARCH_CHUNK_SIZE`                         | `500`          | Entries per search-index chunk                                  |
-| `CLEAR_TABLES`                              | `1`            | **Wipes all three tables before writing.** Set to `0` to append |
+| `CLEAR_TABLES`                              | `1`            | **Wipes all three tables before writing.** Set to `0` to update in place |
+| `PRUNE`                                     | `yes`          | With `CLEAR_TABLES=0`: after writing, delete items the CSV no longer has. `dry-run` lists them, `force` skips the limit, `no` keeps them |
+| `PRUNE_MAX_FRACTION`                        | `0.25`         | Largest share of the DOI table a prune may delete                |
 
 `CLEAR_TABLES` defaults to on, so a plain run is a full rebuild, not an incremental
 update. Set it to `0` if that is not what you want.
+
+An update in place (the nightly workflow's mode) overwrites each DOI in the CSV, and then
+prunes: it deletes the DOI items, prefixes and search chunks that an earlier load wrote and
+this CSV no longer has, so a record removed from FLoRA, or one whose DOI was corrected, also
+leaves the API. The Atlas pipeline's `meta#…` and `aggregate#…` items are never deleted.
+The prune runs only after every write has succeeded, and prints each DOI it deletes. If
+more than `PRUNE_MAX_FRACTION` of the DOI table would go, it deletes nothing and exits
+with status 5: the new data is still in place, and a run with `PRUNE=force` (the workflow's
+`prune` input) deletes them once you have checked the list. A prune that fails part way
+exits with status 6; the load is complete and the next run prunes again. If the Atlas
+pipeline's `update_item` lands on a DOI just after it was pruned, it recreates a partial
+item, which the next night's prune removes.
 
 ## Repository layout
 
